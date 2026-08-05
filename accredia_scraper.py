@@ -19,14 +19,27 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from bs4 import BeautifulSoup
 from rich import box
 from rich.console import Console, Group
 from rich.logging import RichHandler
 from rich.panel import Panel
+from rich.prompt import Confirm
 from rich.table import Table
 from rich.text import Text
 
 from accredia_downloader import __version__
+from accredia_downloader.client import (
+    AccrediaBrowserClient,
+    BrowserClientError,
+    PageSnapshot,
+)
+from accredia_downloader.parser import (
+    CAPTCHA_GATE_TEXT,
+    CERTIFICATE_MARKER,
+    CERTIFICATE_TABLE_SELECTOR,
+    parse_total_results,
+)
 
 # ---------------------------------------------------------------------------
 # Costanti dell'applicazione
@@ -44,6 +57,17 @@ SEARCH_URL = (
     "https://services.accredia.it/ppsearch/"
     "accredia_companymask_remote.jsp"
     "?ID_LINK=1739&area=310"
+)
+
+RESULTS_URL = (
+    "https://services.accredia.it/ppsearch/"
+    "accredia_companymask_remote.jsp"
+    "?recaptcha=true"
+    "&LANG=%5BDEFAULT%5D"
+    "&ID_LINK=1739"
+    "&area=310"
+    "&page=0"
+    "&submit=Cerca"
 )
 
 # Accredia mostra normalmente 20 tabelle/certificati per pagina.
@@ -82,6 +106,7 @@ class ScraperConfig:
     max_retries: int
     browser_channel: str
     headless: bool
+    check_session: bool
 
     @property
     def pages_dir(self) -> Path:
@@ -200,6 +225,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--check-session",
+        action="store_true",
+        help=(
+            "Apre Accredia e verifica che la sessione possa "
+            "accedere alla pagina dei risultati."
+        ),
+    )
+
     return parser
 
 
@@ -219,6 +253,7 @@ def config_from_arguments(
         max_retries=arguments.retries,
         browser_channel=arguments.browser_channel,
         headless=arguments.headless,
+        check_session=arguments.check_session,
     )
 
     try:
@@ -351,6 +386,10 @@ def print_configuration(config: ScraperConfig) -> None:
         "Retry massimi",
         str(config.max_retries),
     )
+    table.add_row(
+        "Controllo sessione",
+        format_enabled(config.check_session),
+    )
 
     CONSOLE.print(
         Panel(
@@ -384,6 +423,207 @@ def print_ready_message() -> None:
         )
     )
 
+def is_results_page(snapshot: PageSnapshot) -> bool:
+    """Controlla superficialmente se la pagina contiene risultati."""
+
+    if CAPTCHA_GATE_TEXT.casefold() in snapshot.html.casefold():
+        return False
+
+    soup = BeautifulSoup(snapshot.html, "lxml")
+
+    tables = [
+        table
+        for table in soup.select(
+            CERTIFICATE_TABLE_SELECTOR
+        )
+        if CERTIFICATE_MARKER.casefold()
+        in table.get_text(" ", strip=True).casefold()
+    ]
+
+    return (
+        parse_total_results(snapshot.html) is not None
+        and len(tables) > 0
+    )
+
+
+def print_manual_validation_instructions() -> None:
+    """Mostra le istruzioni per la validazione manuale."""
+
+    message = Text()
+
+    message.append(
+        "La sessione non consente ancora l'accesso ai risultati.\n\n",
+        style="bold yellow",
+    )
+    message.append(
+        "1. Completa manualmente il CAPTCHA nel browser.\n"
+        "2. Lascia vuoti i filtri per ottenere tutti i risultati.\n"
+        "3. Clicca Cerca.\n"
+        "4. Attendi che venga mostrato l'elenco dei certificati."
+    )
+
+    CONSOLE.print(
+        Panel(
+            message,
+            title="[bold]VERIFICA MANUALE[/bold]",
+            title_align="left",
+            border_style="yellow",
+            padding=(1, 2),
+            safe_box=True,
+        )
+    )
+
+
+def print_session_success(
+    *,
+    total_results: int,
+    records_on_page: int,
+    current_url: str,
+) -> None:
+    """Mostra il risultato positivo del controllo."""
+
+    table = Table(
+        box=box.SIMPLE,
+        show_header=False,
+        pad_edge=False,
+        safe_box=True,
+        expand=True,
+    )
+
+    table.add_column(
+        "Parametro",
+        style="bold green",
+        width=24,
+        no_wrap=True,
+    )
+    table.add_column(
+        "Valore",
+        overflow="fold",
+    )
+
+    table.add_row(
+        "Stato sessione",
+        "[bold green]VALIDA[/bold green]",
+    )
+    table.add_row(
+        "Risultati",
+        f"{total_results:,}".replace(",", "."),
+    )
+    table.add_row(
+        "Tabelle nella pagina",
+        str(records_on_page),
+    )
+    table.add_row(
+        "URL corrente",
+        current_url,
+    )
+
+    CONSOLE.print(
+        Panel(
+            table,
+            title="[bold]CONTROLLO COMPLETATO[/bold]",
+            title_align="left",
+            border_style="green",
+            padding=(0, 1),
+            safe_box=True,
+        )
+    )
+
+
+def run_session_check(
+    config: ScraperConfig,
+) -> int:
+    """
+    Verifica la sessione senza scaricare o salvare certificati.
+
+    Se necessario permette all'utente di completare manualmente il CAPTCHA.
+    """
+
+    try:
+        with AccrediaBrowserClient(
+            profile_dir=config.profile_dir,
+            browser_channel=config.browser_channel,
+            headless=config.headless,
+            timeout_ms=config.request_timeout_ms,
+            max_retries=config.max_retries,
+        ) as client:
+            CONSOLE.print(
+                "\n[cyan]Apertura della pagina dei risultati...[/cyan]"
+            )
+
+            snapshot = client.navigate(RESULTS_URL)
+
+            if not is_results_page(snapshot):
+                if config.headless:
+                    CONSOLE.print(
+                        Panel(
+                            "La sessione non è valida. "
+                            "Ripeti il controllo senza --headless.",
+                            border_style="red",
+                            safe_box=True,
+                        )
+                    )
+                    return 2
+
+                # Torniamo alla maschera per permettere il CAPTCHA.
+                client.navigate(SEARCH_URL)
+                print_manual_validation_instructions()
+
+                Confirm.ask(
+                    "Hai completato il CAPTCHA e visualizzi i risultati?",
+                    console=CONSOLE,
+                    default=True,
+                )
+
+                snapshot = client.current_snapshot()
+
+            if not is_results_page(snapshot):
+                CONSOLE.print(
+                    Panel(
+                        "La pagina corrente non contiene risultati validi.",
+                        border_style="red",
+                        safe_box=True,
+                    )
+                )
+                return 2
+
+            soup = BeautifulSoup(snapshot.html, "lxml")
+
+            tables = [
+                table
+                for table in soup.select(
+                    CERTIFICATE_TABLE_SELECTOR
+                )
+                if CERTIFICATE_MARKER.casefold()
+                in table.get_text(" ", strip=True).casefold()
+            ]
+
+            total_results = parse_total_results(
+                snapshot.html
+            )
+
+            if total_results is None:
+                return 2
+
+            print_session_success(
+                total_results=total_results,
+                records_on_page=len(tables),
+                current_url=snapshot.url,
+            )
+
+            return 0
+
+    except BrowserClientError as error:
+        CONSOLE.print(
+            Panel(
+                str(error),
+                title="[bold]ERRORE BROWSER[/bold]",
+                border_style="red",
+                safe_box=True,
+            )
+        )
+        return 2
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -398,6 +638,10 @@ def main() -> int:
     config = config_from_arguments(parser)
 
     print_configuration(config)
+
+    if config.check_session:
+        return run_session_check(config)
+
     print_ready_message()
 
     # Nei prossimi blocchi verrà avviato qui il downloader.
