@@ -120,6 +120,7 @@ class AccrediaBrowserClient:
         try:
             self._playwright = sync_playwright().start()
 
+            # Opzioni condivise da Chromium e Firefox.
             launch_options: dict[str, object] = {
                 "headless": self.headless,
                 "viewport": {
@@ -127,21 +128,28 @@ class AccrediaBrowserClient:
                     "height": 1000,
                 },
                 "locale": "it-IT",
-
-                # Mantiene attivo il sandbox di sicurezza di Chromium.
-                # Evita inoltre l'avviso relativo a --no-sandbox
-                # mostrato da Chrome e Microsoft Edge.
-                "chromium_sandbox": True,
             }
 
-            # `chromium` indica il browser distribuito da Playwright.
-            # Chrome ed Edge richiedono invece il relativo channel.
-            if self.browser_channel != "chromium":
-                launch_options["channel"] = self.browser_channel
+            if self.browser_channel == "firefox":
+                # Firefox usa un motore separato e non accetta
+                # le opzioni specifiche di Chromium.
+                browser_type = self._playwright.firefox
+            else:
+                browser_type = self._playwright.chromium
 
+                # Questa opzione è valida esclusivamente per Chromium.
+                launch_options["chromium_sandbox"] = True
+
+                # Chrome ed Edge sono canali del motore Chromium.
+                # "chromium" usa il browser incluso in Playwright.
+                if self.browser_channel != "chromium":
+                    launch_options["channel"] = (
+                        self.browser_channel
+                    )
+
+            # Ogni motore utilizza il proprio profilo persistente.
             self._context = (
-                self._playwright.chromium
-                .launch_persistent_context(
+                browser_type.launch_persistent_context(
                     str(self.profile_dir),
                     **launch_options,
                 )

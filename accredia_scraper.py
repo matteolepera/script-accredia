@@ -211,7 +211,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--browser-channel",
-        choices=("chrome", "msedge", "chromium"),
+        choices=("chrome", "msedge", "chromium", "firefox"),
         default="chrome",
         help="Browser controllato da Playwright. Default: chrome",
     )
