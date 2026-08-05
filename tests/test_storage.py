@@ -6,7 +6,10 @@ import unittest
 from pathlib import Path
 
 from accredia_downloader.storage import (
+    RecordChange,
+    RecordIndex,
     StorageLayout,
+    StorageManager,
     atomic_write_text,
     write_certificate,
 )
@@ -110,6 +113,160 @@ class CertificateWriterTests(unittest.TestCase):
                 "Caserta",
             )
 
+class StorageManagerTests(unittest.TestCase):
+    def test_saves_new_record_and_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = StorageManager.open(
+                Path(temporary_directory)
+            )
+            record = build_record()
+
+            result = manager.save_record(
+                record,
+                run_id="run-1",
+            )
+            manager.save_index()
+
+            self.assertEqual(result.change, RecordChange.NEW)
+            self.assertTrue(result.path.is_file())
+            self.assertTrue(manager.layout.index_path.is_file())
+
+            loaded_index = RecordIndex.load(
+                manager.layout.index_path
+            )
+            entry = loaded_index.get(record.record_id)
+
+            self.assertIsNotNone(entry)
+            self.assertEqual(
+                entry.content_hash,
+                record.content_hash,
+            )
+
+    def test_does_not_rewrite_unchanged_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = StorageManager.open(
+                Path(temporary_directory)
+            )
+            record = build_record()
+
+            manager.save_record(record, run_id="run-1")
+
+            result = manager.save_record(
+                record,
+                run_id="run-2",
+            )
+
+            self.assertEqual(
+                result.change,
+                RecordChange.UNCHANGED,
+            )
+
+    def test_updates_changed_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = StorageManager.open(
+                Path(temporary_directory)
+            )
+
+            original = build_record(
+                scope="Primo scopo."
+            )
+            updated = build_record(
+                scope="Scopo aggiornato."
+            )
+
+            manager.save_record(original, run_id="run-1")
+            result = manager.save_record(
+                updated,
+                run_id="run-2",
+            )
+
+            self.assertEqual(
+                original.record_id,
+                updated.record_id,
+            )
+            self.assertEqual(
+                result.change,
+                RecordChange.UPDATED,
+            )
+
+            payload = json.loads(
+                result.path.read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(
+                payload["scope"],
+                "Scopo aggiornato.",
+            )
+
+    def test_moves_record_to_new_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = StorageManager.open(
+                Path(temporary_directory)
+            )
+
+            original = build_record(url_page=0)
+            moved = build_record(url_page=1)
+
+            first_result = manager.save_record(
+                original,
+                run_id="run-1",
+            )
+            moved_result = manager.save_record(
+                moved,
+                run_id="run-2",
+            )
+
+            self.assertEqual(
+                moved_result.change,
+                RecordChange.MOVED,
+            )
+            self.assertFalse(first_result.path.exists())
+            self.assertTrue(moved_result.path.exists())
+            self.assertEqual(
+                moved_result.path.parent.name,
+                "2",
+            )
+
+    def test_recovers_deleted_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = StorageManager.open(
+                Path(temporary_directory)
+            )
+            record = build_record()
+
+            first_result = manager.save_record(
+                record,
+                run_id="run-1",
+            )
+            first_result.path.unlink()
+
+            recovered_result = manager.save_record(
+                record,
+                run_id="run-2",
+            )
+
+            self.assertEqual(
+                recovered_result.change,
+                RecordChange.RECOVERED,
+            )
+            self.assertTrue(recovered_result.path.exists())
+
+    def test_marks_records_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = StorageManager.open(
+                Path(temporary_directory)
+            )
+            record = build_record()
+
+            manager.save_record(record, run_id="run-1")
+            manager.finish_run("run-1")
+
+            missing_count = manager.finish_run("run-2")
+            entry = manager.index.get(record.record_id)
+
+            self.assertEqual(missing_count, 1)
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.missing_runs, 1)
 
 if __name__ == "__main__":
     unittest.main()
