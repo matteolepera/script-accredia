@@ -4,6 +4,8 @@ import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from bs4 import BeautifulSoup
+
 from accredia_downloader.parser import (
     ParsingError,
     SessionExpiredError,
@@ -125,6 +127,25 @@ class ResultPageParserTests(unittest.TestCase):
         self.assertEqual(
             record.updated_on,
             "2026-08-03",
+        )
+
+        # Verifica che venga conservata l'intera tabella HTML,
+        # non soltanto il suo contenuto testuale.
+        soup = BeautifulSoup(self.html, "lxml")
+        expected_table = soup.select_one(
+            "div.ppsearch > table"
+        )
+
+        self.assertIsNotNone(expected_table)
+        self.assertEqual(
+            record.raw_html,
+            str(expected_table),
+        )
+        self.assertTrue(
+            record.raw_html.startswith("<table")
+        )
+        self.assertTrue(
+            record.raw_html.endswith("</table>")
         )
 
     def test_detects_expired_session(self) -> None:

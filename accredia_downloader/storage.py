@@ -152,7 +152,7 @@ def atomic_write_lines(
     destination: Path,
     lines: Iterable[str],
     *,
-    retries: int = 3,
+    retries: int = 10000,
     retry_delay_seconds: float = 0.25,
 ) -> None:
     """
