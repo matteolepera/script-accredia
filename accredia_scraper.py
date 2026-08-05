@@ -26,6 +26,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from accredia_downloader import __version__
 
 # ---------------------------------------------------------------------------
 # Costanti dell'applicazione
@@ -33,7 +34,7 @@ from rich.text import Text
 
 APP_NAME = "Accredia SC"
 
-APP_VERSION = "0.1.0"
+APP_VERSION = __version__
 
 # Console condivisa da tutta l'applicazione.
 # Rich rileva automaticamente le capacità del terminale Windows.
@@ -304,9 +305,9 @@ def format_enabled(value: bool) -> Text:
     """Converte un valore booleano in uno stato leggibile."""
 
     if value:
-        return Text("ATTIVA", style="bold yellow")
+        return Text("ATTIVATA", style="bold yellow")
 
-    return Text("DISATTIVA", style="bold green")
+    return Text("DISATTIVATA", style="bold green")
 
 
 def print_configuration(config: ScraperConfig) -> None:
