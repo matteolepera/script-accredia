@@ -1,0 +1,1 @@
+"""Test automatici dell'Accredia Downloader."""
