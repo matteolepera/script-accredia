@@ -127,6 +127,11 @@ class AccrediaBrowserClient:
                     "height": 1000,
                 },
                 "locale": "it-IT",
+
+                # Mantiene attivo il sandbox di sicurezza di Chromium.
+                # Evita inoltre l'avviso relativo a --no-sandbox
+                # mostrato da Chrome e Microsoft Edge.
+                "chromium_sandbox": True,
             }
 
             # `chromium` indica il browser distribuito da Playwright.
