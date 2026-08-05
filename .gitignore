@@ -1,0 +1,30 @@
+.accredia-playwright-profile/
+__pycache__/
+*.pyc
+.venv/
+
+# Dati scaricati e stato locale
+documenti/accredia/
+output/
+
+# Sessioni, credenziali e configurazione locale
+.env
+.env.*
+!.env.example
+
+# Cache e report Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build e pacchetti
+build/
+dist/
+*.egg-info/
+
+# File di sistema
+.DS_Store
+Thumbs.db
+Desktop.ini
