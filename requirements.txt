@@ -1,3 +1,4 @@
 beautifulsoup4>=4.12
 lxml>=5
 playwright>=1.50
+rich>=14.1,<15

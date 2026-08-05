@@ -19,12 +19,25 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from rich import box
+from rich.console import Console, Group
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
 
 # ---------------------------------------------------------------------------
 # Costanti dell'applicazione
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Accredia SC"
+
+APP_VERSION = "0.1.0"
+
+# Console condivisa da tutta l'applicazione.
+# Rich rileva automaticamente le capacità del terminale Windows.
+CONSOLE = Console(highlight=False)
 
 SEARCH_URL = (
     "https://services.accredia.it/ppsearch/"
@@ -221,14 +234,154 @@ def config_from_arguments(
 # ---------------------------------------------------------------------------
 
 def configure_logging() -> None:
-    """Configura messaggi leggibili sia su Windows sia negli altri sistemi."""
+    """
+    Configura il logging usando Rich.
+
+    Il logger rimarrà disponibile per errori, retry e diagnostica,
+    mentre pannelli e tabelle verranno usati per le informazioni principali.
+    """
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format="%(message)s",
+        datefmt="%H:%M:%S",
+        handlers=[
+            RichHandler(
+                console=CONSOLE,
+                show_time=True,
+                show_level=True,
+                show_path=False,
+                markup=False,
+                rich_tracebacks=True,
+                tracebacks_show_locals=False,
+            )
+        ],
+        # `force=True` evita configurazioni duplicate se main viene richiamato
+        # più volte durante i test.
+        force=True,
     )
 
+# ---------------------------------------------------------------------------
+# Interfaccia del terminale
+# ---------------------------------------------------------------------------
+
+def print_application_header() -> None:
+    """Mostra l'intestazione principale dell'applicazione."""
+
+    title = Text()
+    title.append("ACCREDIA", style="bold cyan")
+    title.append(" DOWNLOADER", style="bold white")
+
+    subtitle = Text(
+        "Raccolta e aggiornamento dei certificati",
+        style="dim white",
+    )
+
+    version = Text(
+        f"Versione {APP_VERSION}",
+        style="dim cyan",
+    )
+
+    content = Group(
+        title,
+        subtitle,
+        Text(""),
+        version,
+    )
+
+    CONSOLE.print()
+    CONSOLE.print(
+        Panel(
+            content,
+            border_style="cyan",
+            padding=(1, 2),
+            safe_box=True,
+        )
+    )
+
+
+def format_enabled(value: bool) -> Text:
+    """Converte un valore booleano in uno stato leggibile."""
+
+    if value:
+        return Text("ATTIVA", style="bold yellow")
+
+    return Text("DISATTIVA", style="bold green")
+
+
+def print_configuration(config: ScraperConfig) -> None:
+    """Mostra la configurazione in una tabella compatta."""
+
+    table = Table(
+        box=box.SIMPLE,
+        show_header=False,
+        pad_edge=False,
+        safe_box=True,
+        expand=True,
+    )
+
+    table.add_column(
+        "Parametro",
+        style="bold cyan",
+        no_wrap=True,
+        width=24,
+    )
+
+    table.add_column(
+        "Valore",
+        style="white",
+        overflow="fold",
+    )
+
+    table.add_row("Directory dati", str(config.output_root))
+    table.add_row("Directory pagine", str(config.pages_dir))
+    table.add_row("Profilo Playwright", str(config.profile_dir))
+    table.add_row("Browser", config.browser_channel)
+    table.add_row("Modalità headless", format_enabled(config.headless))
+    table.add_row(
+        "Ritardo richieste",
+        f"{config.delay_seconds:.1f} secondi",
+    )
+    table.add_row(
+        "Timeout",
+        f"{config.request_timeout_ms // 1_000} secondi",
+    )
+    table.add_row(
+        "Retry massimi",
+        str(config.max_retries),
+    )
+
+    CONSOLE.print(
+        Panel(
+            table,
+            title="[bold]CONFIGURAZIONE[/bold]",
+            title_align="left",
+            border_style="blue",
+            padding=(0, 1),
+            safe_box=True,
+        )
+    )
+
+
+def print_ready_message() -> None:
+    """Comunica che la configurazione è stata validata."""
+
+    message = Text()
+    message.append("OK", style="bold green")
+    message.append("  Configurazione validata. ")
+    message.append(
+        "Il downloader è pronto per essere avviato.",
+        style="dim",
+    )
+
+    CONSOLE.print(
+        Panel(
+            message,
+            border_style="green",
+            padding=(0, 1),
+            safe_box=True,
+        )
+    )
 
 # ---------------------------------------------------------------------------
 # Entrypoint
@@ -238,21 +391,15 @@ def main() -> int:
     """Punto di ingresso del programma."""
 
     configure_logging()
+    print_application_header()
 
     parser = build_argument_parser()
     config = config_from_arguments(parser)
 
-    logger = logging.getLogger(APP_NAME)
+    print_configuration(config)
+    print_ready_message()
 
-    logger.info("Configurazione valida.")
-    logger.info("Directory dati: %s", config.output_root)
-    logger.info("Directory pagine: %s", config.pages_dir)
-    logger.info("Profilo Playwright: %s", config.profile_dir)
-    logger.info("Browser: %s", config.browser_channel)
-    logger.info("Modalità headless: %s", config.headless)
-    logger.info("Ritardo tra richieste: %.1f secondi", config.delay_seconds)
-
-    # Nei prossimi blocchi chiameremo qui il downloader effettivo.
+    # Nei prossimi blocchi verrà avviato qui il downloader.
     return 0
 
 
