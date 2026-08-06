@@ -1,62 +1,34 @@
-"""
-Archiviazione e indice degli aggiornamenti.
-
-Il modulo gestisce:
-
-- struttura delle directory;
-- scrittura atomica compatibile con Windows;
-- indice JSONL dei record;
-- riconoscimento di nuovi record e aggiornamenti;
-- spostamenti tra pagine;
-- ripristino dei file mancanti.
-"""
+"""Storage regionale transazionale ed esportazione JSON atomica."""
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from accredia_downloader.models import CertificateRecord
+from accredia_downloader.models import (
+    SCHEMA_VERSION,
+    CertificateRecord,
+)
 
 
 INDEX_FILENAME = "records-index.jsonl"
+LAST_RUN_FILENAME = "last-run.json"
+STAGING_FILENAME = "staging.sqlite"
+CERTIFICATES_FILENAME = "certificati.json"
 
 
-# ---------------------------------------------------------------------------
-# Tipi di modifica
-# ---------------------------------------------------------------------------
-
-class RecordChange(str, Enum):
-    """Possibili risultati del salvataggio di un record."""
-
-    NEW = "new"
-    UPDATED = "updated"
-    MOVED = "moved"
-    UNCHANGED = "unchanged"
-    RECOVERED = "recovered"
+class StorageError(RuntimeError):
+    """Errore nello staging o nell'esportazione regionale."""
 
 
 @dataclass(frozen=True, slots=True)
-class SaveResult:
-    """Risultato del salvataggio di un certificato."""
-
-    change: RecordChange
-    path: Path
-    previous_path: Path | None = None
-
-
-# ---------------------------------------------------------------------------
-# Struttura delle directory
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True, slots=True)
-class StorageLayout:
-    """Descrive la struttura delle directory dello scraper."""
+class RegionStorageLayout:
+    """Percorsi utilizzati da una singola regione."""
 
     root: Path
 
@@ -64,116 +36,61 @@ class StorageLayout:
         object.__setattr__(self, "root", self.root.resolve())
 
     @property
-    def pages_dir(self) -> Path:
-        return self.root / "pages"
+    def certificates_path(self) -> Path:
+        return self.root / CERTIFICATES_FILENAME
 
     @property
     def state_dir(self) -> Path:
         return self.root / "state"
 
     @property
-    def runs_dir(self) -> Path:
-        return self.root / "runs"
-
-    @property
-    def archive_dir(self) -> Path:
-        return self.root / "archive"
-
-    @property
-    def errors_dir(self) -> Path:
-        return self.root / "errors"
+    def staging_path(self) -> Path:
+        return self.state_dir / STAGING_FILENAME
 
     @property
     def index_path(self) -> Path:
         return self.state_dir / INDEX_FILENAME
 
+    @property
+    def last_run_path(self) -> Path:
+        return self.state_dir / LAST_RUN_FILENAME
+
     def create_directories(self) -> None:
-        """Crea tutte le directory principali."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
 
-        for directory in (
-            self.pages_dir,
-            self.state_dir,
-            self.runs_dir,
-            self.archive_dir,
-            self.errors_dir,
-        ):
-            directory.mkdir(parents=True, exist_ok=True)
+    def staging_files(self) -> tuple[Path, ...]:
+        """Database SQLite e possibili file WAL temporanei."""
 
-    def page_dir(self, page: int) -> Path:
-        """Restituisce la directory one-based di una pagina."""
+        return (
+            self.staging_path,
+            Path(f"{self.staging_path}-wal"),
+            Path(f"{self.staging_path}-shm"),
+        )
 
-        if page < 1:
-            raise ValueError("Il numero della pagina deve partire da 1.")
+    def remove_staging(self, *, retries: int = 3) -> None:
+        """Elimina soltanto i file temporanei dello staging."""
 
-        return self.pages_dir / str(page)
+        for path in self.staging_files():
+            remove_file(path, retries=retries)
 
-    def certificate_path(
-        self,
-        record: CertificateRecord,
-    ) -> Path:
-        """Calcola il percorso definitivo di un certificato."""
-
-        filename = f"cert-{record.record_id}.json"
-        return self.page_dir(record.source.page) / filename
-
-    def relative_path(self, path: Path) -> str:
-        """
-        Converte un percorso in formato portabile.
-
-        Nell'indice utilizziamo sempre `/`, anche quando il programma
-        viene eseguito su Windows.
-        """
-
-        return path.resolve().relative_to(self.root).as_posix()
-
-    def absolute_path(self, relative_path: str) -> Path:
-        """
-        Ricostruisce un percorso locale partendo dal formato dell'indice.
-
-        Il controllo di `..` impedisce che un indice danneggiato possa
-        puntare fuori dalla directory principale.
-        """
-
-        portable_path = PurePosixPath(relative_path)
-
-        if portable_path.is_absolute() or ".." in portable_path.parts:
-            raise ValueError(
-                f"Percorso non valido nell'indice: {relative_path}"
-            )
-
-        return self.root.joinpath(*portable_path.parts)
-
-
-# ---------------------------------------------------------------------------
-# Scrittura atomica
-# ---------------------------------------------------------------------------
 
 def atomic_write_lines(
     destination: Path,
     lines: Iterable[str],
     *,
-    retries: int = 10000,
+    retries: int = 3,
     retry_delay_seconds: float = 0.25,
 ) -> None:
-    """
-    Scrive una sequenza di stringhe in modo atomico.
-
-    L'uso di un iterabile permette di salvare un indice molto grande senza
-    costruire l'intero contenuto in memoria.
-    """
+    """Scrive un file UTF-8 e lo sostituisce atomicamente."""
 
     if retries < 0:
         raise ValueError("Il numero di retry non può essere negativo.")
 
-    if retry_delay_seconds < 0:
-        raise ValueError("Il ritardo dei retry non può essere negativo.")
-
     destination.parent.mkdir(parents=True, exist_ok=True)
-
     temporary_path: Path | None = None
 
     try:
-        # Su Windows il file deve essere chiuso prima della sostituzione.
         with NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -197,12 +114,9 @@ def atomic_write_lines(
                 if attempt >= retries:
                     raise
 
-                time.sleep(
-                    retry_delay_seconds * (attempt + 1)
-                )
-
+                time.sleep(retry_delay_seconds * (attempt + 1))
     finally:
-        if temporary_path and temporary_path.exists():
+        if temporary_path is not None and temporary_path.exists():
             try:
                 temporary_path.unlink()
             except OSError:
@@ -214,16 +128,26 @@ def atomic_write_text(
     content: str,
     *,
     retries: int = 3,
-    retry_delay_seconds: float = 0.25,
 ) -> None:
     """Scrive atomicamente una singola stringa."""
 
-    atomic_write_lines(
-        destination,
-        (content,),
-        retries=retries,
-        retry_delay_seconds=retry_delay_seconds,
-    )
+    atomic_write_lines(destination, (content,), retries=retries)
+
+
+def atomic_write_json(
+    destination: Path,
+    payload: dict[str, object],
+    *,
+    retries: int = 3,
+) -> None:
+    """Serializza e salva atomicamente un documento JSON."""
+
+    content = json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n"
+    atomic_write_text(destination, content, retries=retries)
 
 
 def remove_file(
@@ -232,7 +156,7 @@ def remove_file(
     retries: int = 3,
     retry_delay_seconds: float = 0.25,
 ) -> None:
-    """Rimuove un file con retry per eventuali blocchi temporanei Windows."""
+    """Rimuove un file con retry per i lock temporanei di Windows."""
 
     if not path.exists():
         return
@@ -248,308 +172,557 @@ def remove_file(
             time.sleep(retry_delay_seconds * (attempt + 1))
 
 
-def write_certificate(
-    layout: StorageLayout,
-    record: CertificateRecord,
-    *,
-    retries: int = 3,
-) -> Path:
-    """Scrive il JSON del certificato e restituisce il percorso."""
-
-    destination = layout.certificate_path(record)
-
-    atomic_write_text(
-        destination,
-        record.to_json(),
-        retries=retries,
-    )
-
-    return destination
-
-
-# ---------------------------------------------------------------------------
-# Indice JSONL
-# ---------------------------------------------------------------------------
-
-@dataclass(slots=True)
-class RecordIndexEntry:
-    """Voce dell'indice locale di un certificato/sede."""
+@dataclass(frozen=True, slots=True)
+class RegionalIndexEntry:
+    """Voce compatta usata per confrontare due snapshot regionali."""
 
     record_id: str
+    entity_id: str
     content_hash: str
-    path: str
     first_seen_run: str
     last_seen_run: str
-    source_page: int
-    source_position: int
-    missing_runs: int = 0
 
-    def to_dict(self) -> dict[str, str | int]:
+    def to_dict(self) -> dict[str, str]:
         return {
             "record_id": self.record_id,
+            "entity_id": self.entity_id,
             "content_hash": self.content_hash,
-            "path": self.path,
             "first_seen_run": self.first_seen_run,
             "last_seen_run": self.last_seen_run,
-            "source_page": self.source_page,
-            "source_position": self.source_position,
-            "missing_runs": self.missing_runs,
         }
 
-    @classmethod
-    def from_dict(
-        cls,
-        payload: dict[str, object],
-    ) -> RecordIndexEntry:
-        """Ricostruisce e valida una voce letta dal file JSONL."""
 
-        return cls(
-            record_id=str(payload["record_id"]),
-            content_hash=str(payload["content_hash"]),
-            path=str(payload["path"]),
-            first_seen_run=str(payload["first_seen_run"]),
-            last_seen_run=str(payload["last_seen_run"]),
-            source_page=int(payload["source_page"]),
-            source_position=int(payload["source_position"]),
-            missing_runs=int(payload.get("missing_runs", 0)),
-        )
-
-
-class RecordIndex:
-    """Indice in memoria dei record già conosciuti."""
+class RegionalIndex:
+    """Indice regionale mantenuto separato dal JSON con gli HTML."""
 
     def __init__(
         self,
-        entries: dict[str, RecordIndexEntry] | None = None,
+        entries: dict[str, RegionalIndexEntry] | None = None,
     ) -> None:
         self.entries = entries or {}
 
     @classmethod
-    def load(cls, index_path: Path) -> RecordIndex:
-        """
-        Carica l'indice una riga alla volta.
-
-        Un file inesistente rappresenta semplicemente una prima esecuzione.
-        """
-
-        if not index_path.exists():
+    def load(cls, path: Path) -> RegionalIndex:
+        if not path.exists():
             return cls()
 
-        entries: dict[str, RecordIndexEntry] = {}
+        entries: dict[str, RegionalIndexEntry] = {}
 
-        with index_path.open(
-            mode="r",
-            encoding="utf-8",
-        ) as index_file:
+        with path.open("r", encoding="utf-8") as index_file:
             for line_number, line in enumerate(index_file, start=1):
-                stripped_line = line.strip()
-
-                if not stripped_line:
+                if not line.strip():
                     continue
 
                 try:
-                    payload = json.loads(stripped_line)
-                    entry = RecordIndexEntry.from_dict(payload)
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                    raise ValueError(
-                        "Indice non valido alla riga "
-                        f"{line_number}: {index_path}"
+                    payload = json.loads(line)
+                    entry = RegionalIndexEntry(
+                        record_id=str(payload["record_id"]),
+                        entity_id=str(payload["entity_id"]),
+                        content_hash=str(payload["content_hash"]),
+                        first_seen_run=str(payload["first_seen_run"]),
+                        last_seen_run=str(payload["last_seen_run"]),
+                    )
+                except (
+                    KeyError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ) as error:
+                    raise StorageError(
+                        f"Indice non valido alla riga {line_number}: {path}"
                     ) from error
 
                 if entry.record_id in entries:
-                    raise ValueError(
-                        "Record duplicato nell'indice: "
-                        f"{entry.record_id}"
+                    raise StorageError(
+                        f"record_id duplicato nell'indice: {entry.record_id}"
                     )
 
                 entries[entry.record_id] = entry
 
         return cls(entries)
 
-    def get(
-        self,
-        record_id: str,
-    ) -> RecordIndexEntry | None:
-        return self.entries.get(record_id)
-
-    def set(self, entry: RecordIndexEntry) -> None:
-        self.entries[entry.record_id] = entry
-
-    def save(self, index_path: Path) -> None:
-        """
-        Salva l'indice ordinato per record_id.
-
-        Le righe vengono prodotte tramite generatore per limitare l'uso
-        di memoria anche con centinaia di migliaia di record.
-        """
-
-        def generate_lines() -> Iterable[str]:
+    def save(self, path: Path, *, retries: int = 3) -> None:
+        def generate_lines() -> Iterator[str]:
             for record_id in sorted(self.entries):
-                entry = self.entries[record_id]
+                yield json.dumps(
+                    self.entries[record_id].to_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ) + "\n"
 
-                yield (
-                    json.dumps(
-                        entry.to_dict(),
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    )
-                    + "\n"
+        atomic_write_lines(path, generate_lines(), retries=retries)
+
+
+@dataclass(frozen=True, slots=True)
+class RegionalRunSummary:
+    """Statistiche prodotte al completamento di una regione."""
+
+    region: str
+    total_results: int
+    total_pages: int
+    tables_processed: int
+    unique_records: int
+    duplicates_collapsed: int
+    new_records: int
+    updated_records: int
+    unchanged_records: int
+    missing_records: int
+    output_path: Path
+
+
+class StagingDatabase:
+    """Database SQLite temporaneo con transazioni per pagina."""
+
+    def __init__(self, layout: RegionStorageLayout) -> None:
+        self.layout = layout
+        self.layout.create_directories()
+        self.connection = sqlite3.connect(
+            self.layout.staging_path,
+            timeout=30,
+        )
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=FULL")
+        self.connection.execute("PRAGMA foreign_keys=ON")
+        self._create_schema()
+
+    def __enter__(self) -> StagingDatabase:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.connection is None:
+            return
+
+        try:
+            self.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            self.connection.close()
+            self.connection = None  # type: ignore[assignment]
+
+    def _create_schema(self) -> None:
+        self.connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS records (
+                record_id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                certificate_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                document_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS records_entity_id_idx
+            ON records(entity_id);
+
+            CREATE TABLE IF NOT EXISTS occurrences (
+                url_page INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                record_id TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                scraped_at TEXT NOT NULL,
+                PRIMARY KEY (url_page, position),
+                FOREIGN KEY (record_id)
+                    REFERENCES records(record_id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS occurrences_record_id_idx
+            ON occurrences(record_id);
+
+            CREATE TABLE IF NOT EXISTS pages (
+                url_page INTEGER PRIMARY KEY,
+                record_count INTEGER NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+            """
+        )
+        self.connection.commit()
+
+    def set_metadata(self, **values: str | int) -> None:
+        with self.connection:
+            for key, value in values.items():
+                self.connection.execute(
+                    """
+                    INSERT INTO metadata(key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, str(value)),
                 )
 
-        atomic_write_lines(index_path, generate_lines())
+    def metadata(self) -> dict[str, str]:
+        rows = self.connection.execute(
+            "SELECT key, value FROM metadata"
+        )
+        return {str(row["key"]): str(row["value"]) for row in rows}
 
-    def mark_missing(
+    def completed_pages(self) -> set[int]:
+        rows = self.connection.execute("SELECT url_page FROM pages")
+        return {int(row["url_page"]) for row in rows}
+
+    def stage_page(
         self,
-        current_run_id: str,
-    ) -> int:
-        """
-        Incrementa `missing_runs` per i record non visti nel ciclo corrente.
-
-        Restituisce il numero di record mancanti.
-        """
-
-        missing_count = 0
-
-        for entry in self.entries.values():
-            if entry.last_seen_run != current_run_id:
-                entry.missing_runs += 1
-                missing_count += 1
-            else:
-                entry.missing_runs = 0
-
-        return missing_count
-
-
-# ---------------------------------------------------------------------------
-# Gestore principale dell'archiviazione
-# ---------------------------------------------------------------------------
-
-class StorageManager:
-    """Coordina file JSON e indice degli aggiornamenti."""
-
-    def __init__(
-        self,
-        layout: StorageLayout,
-        index: RecordIndex,
-    ) -> None:
-        self.layout = layout
-        self.index = index
-
-    @classmethod
-    def open(cls, root: Path) -> StorageManager:
-        """Apre o inizializza l'archivio locale."""
-
-        layout = StorageLayout(root)
-        layout.create_directories()
-
-        index = RecordIndex.load(layout.index_path)
-
-        return cls(layout=layout, index=index)
-
-    def save_record(
-        self,
-        record: CertificateRecord,
+        records: Iterable[CertificateRecord],
         *,
-        run_id: str,
-        retries: int = 3,
-    ) -> SaveResult:
-        """
-        Salva un record soltanto quando necessario.
+        url_page: int,
+        completed_at: str,
+    ) -> None:
+        """Registra una pagina completa in una singola transazione."""
 
-        L'indice viene aggiornato in memoria. Il chiamante potrà salvarlo
-        su disco al completamento della pagina.
-        """
+        page_records = tuple(records)
 
-        if not run_id.strip():
-            raise ValueError("run_id non può essere vuoto.")
+        if url_page < 0:
+            raise ValueError("url_page non può essere negativo.")
 
-        destination = self.layout.certificate_path(record)
-        existing = self.index.get(record.record_id)
+        positions = [record.source.position for record in page_records]
 
-        previous_path: Path | None = None
+        if len(positions) != len(set(positions)):
+            raise StorageError(
+                f"Pagina {url_page + 1}: posizioni duplicate."
+            )
 
-        if existing is None:
-            change = RecordChange.NEW
+        if any(record.source.url_page != url_page for record in page_records):
+            raise StorageError(
+                f"Pagina {url_page + 1}: metadati sorgente incoerenti."
+            )
+
+        with self.connection:
+            # Una pagina ritentata sostituisce integralmente la versione
+            # incompleta precedente senza incrementare le occorrenze.
+            self.connection.execute(
+                "DELETE FROM occurrences WHERE url_page = ?",
+                (url_page,),
+            )
+            self.connection.execute(
+                "DELETE FROM pages WHERE url_page = ?",
+                (url_page,),
+            )
+            self.connection.execute(
+                """
+                DELETE FROM records
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM occurrences
+                    WHERE occurrences.record_id = records.record_id
+                )
+                """
+            )
+
+            for record in page_records:
+                document_json = json.dumps(
+                    record.to_dict(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+
+                self.connection.execute(
+                    """
+                    INSERT INTO records(
+                        record_id,
+                        entity_id,
+                        certificate_id,
+                        content_hash,
+                        document_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(record_id) DO NOTHING
+                    """,
+                    (
+                        record.record_id,
+                        record.entity_id,
+                        record.certificate_id,
+                        record.content_hash,
+                        document_json,
+                    ),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO occurrences(
+                        url_page,
+                        position,
+                        record_id,
+                        source_url,
+                        scraped_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        url_page,
+                        record.source.position,
+                        record.record_id,
+                        record.source.url,
+                        record.source.scraped_at,
+                    ),
+                )
+
+            self.connection.execute(
+                """
+                INSERT INTO pages(url_page, record_count, completed_at)
+                VALUES (?, ?, ?)
+                """,
+                (url_page, len(page_records), completed_at),
+            )
+
+    def validate_complete(
+        self,
+        *,
+        total_results: int,
+        total_pages: int,
+    ) -> None:
+        """Verifica pagine e tabelle prima dell'esportazione."""
+
+        rows = self.connection.execute(
+            "SELECT url_page, record_count FROM pages ORDER BY url_page"
+        ).fetchall()
+        page_numbers = [int(row["url_page"]) for row in rows]
+        expected_pages = list(range(total_pages))
+
+        if page_numbers != expected_pages:
+            raise StorageError(
+                "Lo staging non contiene tutte le pagine regionali."
+            )
+
+        recorded_tables = sum(int(row["record_count"]) for row in rows)
+        occurrence_count = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM occurrences"
+            ).fetchone()[0]
+        )
+
+        if recorded_tables != total_results:
+            raise StorageError(
+                f"Tabelle registrate {recorded_tables}, "
+                f"risultati dichiarati {total_results}."
+            )
+
+        if occurrence_count != recorded_tables:
+            raise StorageError(
+                "Il conteggio delle occorrenze non coincide con le tabelle."
+            )
+
+    def counts(self) -> tuple[int, int, int]:
+        """Restituisce tabelle, record unici e duplicati accorpati."""
+
+        tables = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM occurrences"
+            ).fetchone()[0]
+        )
+        unique = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM records"
+            ).fetchone()[0]
+        )
+        return tables, unique, tables - unique
+
+    def current_index_rows(self) -> list[tuple[str, str, str]]:
+        rows = self.connection.execute(
+            """
+            SELECT record_id, entity_id, content_hash
+            FROM records
+            ORDER BY record_id
+            """
+        )
+        return [
+            (
+                str(row["record_id"]),
+                str(row["entity_id"]),
+                str(row["content_hash"]),
+            )
+            for row in rows
+        ]
+
+    def iter_export_records(self) -> Iterator[dict[str, object]]:
+        """Produce i record finali senza caricarli tutti in memoria."""
+
+        rows = self.connection.execute(
+            """
+            WITH ranked_occurrences AS (
+                SELECT
+                    record_id,
+                    url_page,
+                    position,
+                    source_url,
+                    scraped_at,
+                    COUNT(*) OVER (
+                        PARTITION BY record_id
+                    ) AS occurrence_count,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY record_id
+                        ORDER BY url_page, position
+                    ) AS occurrence_rank
+                FROM occurrences
+            )
+            SELECT
+                records.document_json,
+                ranked_occurrences.url_page,
+                ranked_occurrences.position,
+                ranked_occurrences.source_url,
+                ranked_occurrences.scraped_at,
+                ranked_occurrences.occurrence_count
+            FROM records
+            JOIN ranked_occurrences
+                ON ranked_occurrences.record_id = records.record_id
+            WHERE ranked_occurrences.occurrence_rank = 1
+            ORDER BY
+                ranked_occurrences.url_page,
+                ranked_occurrences.position,
+                records.record_id
+            """
+        )
+
+        for row in rows:
+            document = json.loads(str(row["document_json"]))
+            source = document["source"]
+            source["url"] = str(row["source_url"])
+            source["url_page"] = int(row["url_page"])
+            source["page"] = int(row["url_page"]) + 1
+            source["position"] = int(row["position"])
+            source["scraped_at"] = str(row["scraped_at"])
+            document["source_occurrences"] = int(
+                row["occurrence_count"]
+            )
+            yield document
+
+
+def finalize_region(
+    *,
+    layout: RegionStorageLayout,
+    staging: StagingDatabase,
+    region: str,
+    run_id: str,
+    started_at: str,
+    completed_at: str,
+    total_results: int,
+    total_pages: int,
+    retries: int = 3,
+) -> RegionalRunSummary:
+    """Valida lo staging e pubblica il nuovo snapshot regionale."""
+
+    staging.validate_complete(
+        total_results=total_results,
+        total_pages=total_pages,
+    )
+    tables, unique, duplicates = staging.counts()
+
+    previous_index = RegionalIndex.load(layout.index_path)
+    previous_entities = {
+        entry.entity_id
+        for entry in previous_index.entries.values()
+    }
+    current_rows = staging.current_index_rows()
+    current_entities = {row[1] for row in current_rows}
+
+    new_records = 0
+    updated_records = 0
+    unchanged_records = 0
+    next_entries: dict[str, RegionalIndexEntry] = {}
+
+    for record_id, entity_id, content_hash in current_rows:
+        previous = previous_index.entries.get(record_id)
+
+        if previous is not None:
+            unchanged_records += 1
+            first_seen_run = previous.first_seen_run
+        elif entity_id in previous_entities:
+            updated_records += 1
+            first_seen_run = run_id
+        else:
+            new_records += 1
             first_seen_run = run_id
 
-        else:
-            previous_path = self.layout.absolute_path(existing.path)
-            first_seen_run = existing.first_seen_run
-
-            content_changed = (
-                existing.content_hash != record.content_hash
-            )
-
-            source_changed = (
-                existing.source_page != record.source.page
-                or existing.source_position != record.source.position
-            )
-
-            path_changed = previous_path != destination
-            file_missing = not previous_path.is_file()
-
-            if content_changed:
-                change = RecordChange.UPDATED
-            elif file_missing:
-                change = RecordChange.RECOVERED
-            elif source_changed or path_changed:
-                change = RecordChange.MOVED
-            else:
-                change = RecordChange.UNCHANGED
-
-        # I record invariati non vengono riscritti.
-        if change is not RecordChange.UNCHANGED:
-            write_certificate(
-                self.layout,
-                record,
-                retries=retries,
-            )
-
-            # Rimuoviamo il vecchio file soltanto dopo aver scritto
-            # correttamente quello nuovo.
-            if (
-                previous_path is not None
-                and previous_path != destination
-                and previous_path.exists()
-            ):
-                remove_file(
-                    previous_path,
-                    retries=retries,
-                )
-
-        entry = RecordIndexEntry(
-            record_id=record.record_id,
-            content_hash=record.content_hash,
-            path=self.layout.relative_path(destination),
+        next_entries[record_id] = RegionalIndexEntry(
+            record_id=record_id,
+            entity_id=entity_id,
+            content_hash=content_hash,
             first_seen_run=first_seen_run,
             last_seen_run=run_id,
-            source_page=record.source.page,
-            source_position=record.source.position,
-            missing_runs=0,
         )
 
-        self.index.set(entry)
+    missing_records = sum(
+        1
+        for entry in previous_index.entries.values()
+        if entry.entity_id not in current_entities
+    )
 
-        return SaveResult(
-            change=change,
-            path=destination,
-            previous_path=previous_path,
-        )
+    def generate_region_json() -> Iterator[str]:
+        yield "{\n"
+        yield '  "schema_version": 1,\n'
+        yield f'  "record_schema_version": {SCHEMA_VERSION},\n'
+        yield f'  "region": {json.dumps(region, ensure_ascii=False)},\n'
+        yield f'  "run_id": {json.dumps(run_id)},\n'
+        yield f'  "started_at": {json.dumps(started_at)},\n'
+        yield f'  "completed_at": {json.dumps(completed_at)},\n'
+        yield f'  "total_results_reported": {total_results},\n'
+        yield f'  "total_pages": {total_pages},\n'
+        yield f'  "tables_processed": {tables},\n'
+        yield f'  "unique_records": {unique},\n'
+        yield f'  "duplicates_collapsed": {duplicates},\n'
+        yield '  "records": [\n'
 
-    def save_index(self) -> None:
-        """Salva atomicamente l'indice corrente."""
+        first_record = True
 
-        self.index.save(self.layout.index_path)
+        for document in staging.iter_export_records():
+            if not first_record:
+                yield ",\n"
 
-    def finish_run(self, run_id: str) -> int:
-        """
-        Completa il ciclo e marca i record non incontrati.
+            encoded = json.dumps(
+                document,
+                ensure_ascii=False,
+                indent=2,
+            )
+            yield "    " + encoded.replace("\n", "\n    ")
+            first_record = False
 
-        L'archiviazione dopo due assenze consecutive verrà implementata
-        separatamente.
-        """
+        yield "\n  ]\n}\n"
 
-        missing_count = self.index.mark_missing(run_id)
-        self.save_index()
+    atomic_write_lines(
+        layout.certificates_path,
+        generate_region_json(),
+        retries=retries,
+    )
 
-        return missing_count
+    RegionalIndex(next_entries).save(
+        layout.index_path,
+        retries=retries,
+    )
+
+    atomic_write_json(
+        layout.last_run_path,
+        {
+            "region": region,
+            "run_id": run_id,
+            "status": "completed",
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "total_results": total_results,
+            "total_pages": total_pages,
+            "tables_processed": tables,
+            "unique_records": unique,
+            "duplicates_collapsed": duplicates,
+            "new_records": new_records,
+            "updated_records": updated_records,
+            "unchanged_records": unchanged_records,
+            "missing_records": missing_records,
+        },
+        retries=retries,
+    )
+
+    return RegionalRunSummary(
+        region=region,
+        total_results=total_results,
+        total_pages=total_pages,
+        tables_processed=tables,
+        unique_records=unique,
+        duplicates_collapsed=duplicates,
+        new_records=new_records,
+        updated_records=updated_records,
+        unchanged_records=unchanged_records,
+        missing_records=missing_records,
+        output_path=layout.certificates_path,
+    )

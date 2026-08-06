@@ -11,6 +11,7 @@ Playwright viene usato per:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,12 +19,15 @@ from types import TracebackType
 
 from playwright.sync_api import (
     BrowserContext,
+    Error as PlaywrightError,
     Page,
     Playwright,
     TimeoutError as PlaywrightTimeoutError,
     sync_playwright,
 )
 
+
+LOGGER = logging.getLogger(__name__)
 
 RETRYABLE_HTTP_STATUSES = {
     429,
@@ -32,6 +36,46 @@ RETRYABLE_HTTP_STATUSES = {
     503,
     504,
 }
+
+RETRYABLE_NETWORK_ERROR_MARKERS = (
+    "connection",
+    "econnrefused",
+    "econnreset",
+    "enetunreach",
+    "enotfound",
+    "err_internet_disconnected",
+    "err_name_not_resolved",
+    "err_network_changed",
+    "etimedout",
+    "network",
+    "socket hang up",
+    "timed out",
+)
+
+MAX_RETRY_DELAY_SECONDS = 30.0
+
+
+def retry_delay_seconds(attempt: int) -> float:
+    """Calcola un backoff esponenziale limitato a 30 secondi."""
+
+    if attempt < 0:
+        raise ValueError("Il numero del tentativo non può essere negativo.")
+
+    # Limitare prima l'esponente evita interi enormi con migliaia di retry.
+    return min(
+        MAX_RETRY_DELAY_SECONDS,
+        float(2 ** min(attempt, 5)),
+    )
+
+
+def is_retryable_network_error(error: PlaywrightError) -> bool:
+    """Riconosce gli errori di rete temporanei prodotti da Playwright."""
+
+    message = str(error).casefold()
+    return any(
+        marker in message
+        for marker in RETRYABLE_NETWORK_ERROR_MARKERS
+    )
 
 
 class BrowserClientError(RuntimeError):
@@ -259,14 +303,36 @@ class AccrediaBrowserClient:
 
             except PlaywrightTimeoutError as error:
                 last_error = error
+            except PlaywrightError as error:
+                # ETIMEDOUT e gli altri errori di connessione non sono
+                # necessariamente PlaywrightTimeoutError. Vanno quindi
+                # intercettati separatamente e ritentati.
+                if not is_retryable_network_error(error):
+                    raise HttpRequestError(
+                        f"Errore Playwright durante la richiesta: {url}"
+                    ) from error
+
+                last_error = error
 
             finally:
                 if response is not None:
-                    response.dispose()
+                    try:
+                        response.dispose()
+                    except PlaywrightError:
+                        # La risposta può risultare già chiusa dopo una
+                        # disconnessione: non deve coprire l'errore originale.
+                        pass
 
             if attempt < self.max_retries:
-                # Backoff crescente: 1, 2, 4 secondi.
-                time.sleep(2**attempt)
+                delay = retry_delay_seconds(attempt)
+                LOGGER.warning(
+                    "Richiesta temporaneamente fallita "
+                    "(tentativo %s/%s). Nuovo tentativo tra %.0f s.",
+                    attempt + 1,
+                    self.max_retries + 1,
+                    delay,
+                )
+                time.sleep(delay)
 
         raise HttpRequestError(
             f"Richiesta fallita dopo "

@@ -41,6 +41,7 @@ RESULTS_CONTAINER_SELECTOR = "div.ppsearch"
 CERTIFICATE_TABLE_SELECTOR = "div.ppsearch > table"
 CERTIFICATE_MARKER = "N.Certificato"
 PAGE_SIZE = 20
+REGION_QUERY_PARAMETER = "PPSEARCH_COMPANY_SEARCH_MASK_REGIONE"
 
 TOTAL_PATTERN = re.compile(
     r"Risultati\s*:\s*([\d.]+)",
@@ -203,6 +204,54 @@ def build_page_url(
 
     if not page_replaced:
         updated_items.append(("page", str(url_page)))
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path,
+            urlencode(updated_items),
+            parts.fragment,
+        )
+    )
+
+
+def build_region_url(
+    results_url: str,
+    region: str,
+) -> str:
+    """Aggiunge o sostituisce il filtro regione nell'URL dei risultati."""
+
+    normalized_region = normalize_text(region)
+
+    if not normalized_region:
+        raise ValueError("La regione non può essere vuota.")
+
+    parts = urlsplit(results_url)
+    query_items = parse_qsl(
+        parts.query,
+        keep_blank_values=True,
+    )
+
+    updated_items: list[tuple[str, str]] = []
+    region_replaced = False
+
+    for key, value in query_items:
+        if key.casefold() == REGION_QUERY_PARAMETER.casefold():
+            if not region_replaced:
+                updated_items.append(
+                    (REGION_QUERY_PARAMETER, normalized_region)
+                )
+                region_replaced = True
+
+            continue
+
+        updated_items.append((key, value))
+
+    if not region_replaced:
+        updated_items.append(
+            (REGION_QUERY_PARAMETER, normalized_region)
+        )
 
     return urlunsplit(
         (

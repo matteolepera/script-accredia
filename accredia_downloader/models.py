@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 
 # Espressione compilata una sola volta e riutilizzata per tutti i record.
 WHITESPACE_PATTERN = re.compile(r"\s+")
@@ -234,6 +234,7 @@ class CertificateRecord:
     """Singola combinazione certificato/sede pubblicata da Accredia."""
 
     certificate_id: str
+    entity_id: str
     record_id: str
     content_hash: str
 
@@ -326,35 +327,35 @@ class CertificateRecord:
             certificate_identity_payload
         )
 
-        record_identity_payload = {
+        entity_identity_payload = {
             "certificate_id": certificate_id,
+            "issued_on": issued_on,
             "site_type": normalize_identity(site.type),
             "site": site.identity_value(),
         }
 
-        record_id = sha256_payload(record_identity_payload)
+        entity_id = sha256_payload(entity_identity_payload)
 
-        semantic_payload = {
-            "certificate_number": certificate_number,
-            "issued_on": issued_on,
-            "status": status,
-            "accreditation_body": accreditation_body.to_dict(),
-            "company": {
-                "name": company_name,
-                "vat_or_tax_code": vat_or_tax_code,
-                "site": site.to_dict(),
-            },
-            "scope": scope,
-            "standard": standard,
-            "accreditation_scheme": accreditation_scheme,
-            "sectors": list(normalized_sectors),
-            "updated_on": updated_on,
-        }
-
-        content_hash = sha256_payload(semantic_payload)
+        # Il contenuto deriva dall'intera tabella HTML normalizzata da
+        # BeautifulSoup. Anche una variazione di punteggiatura produce quindi
+        # una versione distinta, mentre pagina e posizione restano escluse.
+        normalized_raw_html = raw_html.strip()
+        content_hash = sha256_payload(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "raw_html": normalized_raw_html,
+            }
+        )
+        record_id = sha256_payload(
+            {
+                "entity_id": entity_id,
+                "content_hash": content_hash,
+            }
+        )
 
         return cls(
             certificate_id=certificate_id,
+            entity_id=entity_id,
             record_id=record_id,
             content_hash=content_hash,
             certificate_number=certificate_number,
@@ -371,7 +372,7 @@ class CertificateRecord:
             updated_on=updated_on,
             source=source,
             raw_text=raw_text,
-            raw_html=raw_html.strip(),
+            raw_html=normalized_raw_html,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -380,6 +381,7 @@ class CertificateRecord:
         return {
             "schema_version": SCHEMA_VERSION,
             "record_id": self.record_id,
+            "entity_id": self.entity_id,
             "certificate_id": self.certificate_id,
             "certificate_number": self.certificate_number,
             "issued_on": self.issued_on,

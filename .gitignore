@@ -1,5 +1,4 @@
-.accredia-chromium-profile/
-.accredia-playwright-profile/
+.accredia-*-profile/
 __pycache__/
 *.pyc
 .venv/

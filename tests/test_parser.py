@@ -1,6 +1,7 @@
 """Test del parser delle pagine Accredia."""
 
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -10,6 +11,7 @@ from accredia_downloader.parser import (
     ParsingError,
     SessionExpiredError,
     build_page_url,
+    build_region_url,
     calculate_total_pages,
     expected_records_for_page,
     parse_result_page,
@@ -61,6 +63,17 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(query["ID_LINK"], ["1739"])
         self.assertEqual(query["area"], ["310"])
         self.assertEqual(query["submit"], ["Cerca"])
+
+    def test_builds_region_url_preserving_parameters(self) -> None:
+        result = build_region_url(SOURCE_URL, "Abruzzo")
+        query = parse_qs(urlsplit(result).query)
+
+        self.assertEqual(
+            query["PPSEARCH_COMPANY_SEARCH_MASK_REGIONE"],
+            ["Abruzzo"],
+        )
+        self.assertEqual(query["page"], ["0"])
+        self.assertEqual(query["ID_LINK"], ["1739"])
 
 
 class ResultPageParserTests(unittest.TestCase):
@@ -147,6 +160,30 @@ class ResultPageParserTests(unittest.TestCase):
         self.assertTrue(
             record.raw_html.endswith("</table>")
         )
+
+    def test_identifies_identical_tables_as_duplicates(self) -> None:
+        soup = BeautifulSoup(self.html, "lxml")
+        container = soup.select_one("div.ppsearch")
+        first_table = soup.select_one("div.ppsearch > table")
+
+        self.assertIsNotNone(container)
+        self.assertIsNotNone(first_table)
+
+        container.append(deepcopy(first_table))
+
+        page = parse_result_page(
+            str(soup),
+            source_url=SOURCE_URL,
+            url_page=0,
+            scraped_at=SCRAPED_AT,
+        )
+
+        first = page.records[0]
+        duplicate = page.records[2]
+
+        self.assertEqual(first.content_hash, duplicate.content_hash)
+        self.assertEqual(first.entity_id, duplicate.entity_id)
+        self.assertEqual(first.record_id, duplicate.record_id)
 
     def test_detects_expired_session(self) -> None:
         html = """

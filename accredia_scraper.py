@@ -1,21 +1,12 @@
 #!/usr/bin/env python
-"""
-Downloader dei certificati pubblicati nella banca dati Accredia.
-
-Il programma utilizzerà:
-
-- Playwright per condividere la sessione del browser;
-- BeautifulSoup per interpretare le pagine HTML;
-- file JSON distinti per ogni tabella/certificato;
-- un indice locale per riconoscere aggiornamenti e duplicati.
-
-Questo primo blocco contiene soltanto la configurazione generale.
-"""
+"""Downloader regionale dei certificati pubblicati da Accredia."""
 
 from __future__ import annotations
 
 import argparse
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +15,14 @@ from rich import box
 from rich.console import Console, Group
 from rich.logging import RichHandler
 from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeRemainingColumn,
+)
 from rich.prompt import Confirm
 from rich.table import Table
 from rich.text import Text
@@ -38,19 +37,25 @@ from accredia_downloader.parser import (
     CAPTCHA_GATE_TEXT,
     CERTIFICATE_MARKER,
     CERTIFICATE_TABLE_SELECTOR,
+    ParsingError,
+    SessionExpiredError,
+    build_page_url,
+    build_region_url,
     parse_total_results,
 )
+from accredia_downloader.region import (
+    RegionDownloadError,
+    download_region,
+)
+from accredia_downloader.storage import (
+    RegionStorageLayout,
+    RegionalRunSummary,
+    StorageError,
+)
 
-# ---------------------------------------------------------------------------
-# Costanti dell'applicazione
-# ---------------------------------------------------------------------------
 
-APP_NAME = "Accredia SC"
-
+APP_NAME = "Accredia Downloader"
 APP_VERSION = __version__
-
-# Console condivisa da tutta l'applicazione.
-# Rich rileva automaticamente le capacità del terminale Windows.
 CONSOLE = Console(highlight=False)
 
 SEARCH_URL = (
@@ -70,72 +75,63 @@ RESULTS_URL = (
     "&submit=Cerca"
 )
 
-# Accredia mostra normalmente 20 tabelle/certificati per pagina.
-PAGE_SIZE = 20
-
-# Selettori CSS confermati durante l'analisi della pagina.
-RESULTS_CONTAINER_SELECTOR = "div.ppsearch"
-CERTIFICATE_TABLE_SELECTOR = "div.ppsearch > table"
-
-# Testo visualizzato quando la sessione CAPTCHA non è più valida.
-CAPTCHA_GATE_TEXT = "Verifica reCAPTCHA richiesta"
-
-# Percorsi relativi alla directory dalla quale viene avviato lo script.
 DEFAULT_OUTPUT_ROOT = Path("documenti") / "accredia"
 DEFAULT_PROFILE_DIR = Path(".accredia-playwright-profile")
+DEFAULT_NETWORK_RETRIES = 10_000
+LOCAL_FILE_RETRIES = 3
 
 
-# ---------------------------------------------------------------------------
-# Configurazione
-# ---------------------------------------------------------------------------
+def region_slug(region: str) -> str:
+    """Converte il nome della regione in una cartella portabile."""
+
+    normalized = unicodedata.normalize("NFKD", region)
+    without_accents = "".join(
+        character
+        for character in normalized
+        if not unicodedata.combining(character)
+    )
+    slug = re.sub(
+        r"[^a-z0-9]+",
+        "-",
+        without_accents.casefold(),
+    ).strip("-")
+
+    if not slug:
+        raise ValueError("Il nome della regione non è valido.")
+
+    return slug
+
 
 @dataclass(frozen=True, slots=True)
 class ScraperConfig:
-    """
-    Configurazione immutabile dello scraper.
-
-    `frozen=True` impedisce modifiche accidentali durante l'esecuzione.
-    `slots=True` riduce leggermente l'uso di memoria e impedisce
-    l'aggiunta involontaria di attributi.
-    """
+    """Configurazione validata della riga di comando."""
 
     output_root: Path
     profile_dir: Path
     delay_seconds: float
     request_timeout_ms: int
-    max_retries: int
+    network_retries: int
     browser_channel: str
     headless: bool
     check_session: bool
+    region: str | None
 
     @property
-    def pages_dir(self) -> Path:
-        """Directory che conterrà i JSON organizzati per pagina."""
-        return self.output_root / "pages"
+    def storage_root(self) -> Path:
+        if self.region is None:
+            return self.output_root
+
+        return self.output_root / "regioni" / region_slug(self.region)
+
+    @property
+    def certificates_path(self) -> Path:
+        return self.storage_root / "certificati.json"
 
     @property
     def state_dir(self) -> Path:
-        """Directory contenente indici e stato dell'esecuzione."""
-        return self.output_root / "state"
-
-    @property
-    def runs_dir(self) -> Path:
-        """Directory contenente i report delle singole esecuzioni."""
-        return self.output_root / "runs"
-
-    @property
-    def archive_dir(self) -> Path:
-        """Directory destinata ai record non più presenti."""
-        return self.output_root / "archive"
-
-    @property
-    def errors_dir(self) -> Path:
-        """Directory nella quale salvare pagine o record non interpretabili."""
-        return self.output_root / "errors"
+        return self.storage_root / "state"
 
     def validate(self) -> None:
-        """Controlla i parametri prima di avviare qualsiasi richiesta."""
-
         if self.delay_seconds < 1:
             raise ValueError(
                 "Il ritardo tra le richieste non può essere inferiore "
@@ -147,136 +143,112 @@ class ScraperConfig:
                 "Il timeout delle richieste deve essere di almeno 1 secondo."
             )
 
-        if self.max_retries < 0:
+        if self.network_retries < 0:
             raise ValueError(
                 "Il numero massimo di tentativi non può essere negativo."
             )
 
+        if self.region is not None:
+            region_slug(self.region)
 
-# ---------------------------------------------------------------------------
-# Argomenti della riga di comando
-# ---------------------------------------------------------------------------
 
 def build_argument_parser() -> argparse.ArgumentParser:
-    """Definisce i parametri accettati dalla riga di comando."""
+    """Definisce i parametri accettati dal programma."""
 
     parser = argparse.ArgumentParser(
         prog="accredia_scraper",
         description=(
-            "Scarica e aggiorna i certificati pubblicati nella banca dati "
+            "Scarica e aggiorna un unico JSON per regione dalla banca dati "
             "Accredia."
         ),
     )
-
     parser.add_argument(
         "--output-root",
         type=Path,
         default=DEFAULT_OUTPUT_ROOT,
-        help=(
-            "Directory principale dei dati. "
-            "Default: documenti/accredia"
-        ),
+        help="Directory principale. Default: documenti/accredia",
     )
-
     parser.add_argument(
         "--profile-dir",
         type=Path,
         default=DEFAULT_PROFILE_DIR,
         help=(
-            "Profilo persistente utilizzato da Playwright. "
+            "Profilo persistente Playwright. "
             "Default: .accredia-playwright-profile"
         ),
     )
-
+    parser.add_argument(
+        "--region",
+        type=str,
+        help="Regione da scaricare, per esempio Abruzzo.",
+    )
     parser.add_argument(
         "--delay",
         type=float,
         default=2.0,
-        help="Secondi di attesa tra due pagine. Default: 2",
+        help="Secondi tra due pagine. Default: 2",
     )
-
     parser.add_argument(
         "--timeout",
         type=int,
         default=60,
-        help="Timeout di ogni richiesta espresso in secondi. Default: 60",
+        help="Timeout di ogni richiesta in secondi. Default: 60",
     )
-
     parser.add_argument(
         "--retries",
         type=int,
-        default=3,
-        help="Numero massimo di nuovi tentativi per pagina. Default: 3",
+        default=DEFAULT_NETWORK_RETRIES,
+        help="Nuovi tentativi di rete per richiesta. Default: 10000",
     )
-
     parser.add_argument(
         "--browser-channel",
         choices=("chrome", "msedge", "chromium", "firefox"),
         default="chrome",
         help="Browser controllato da Playwright. Default: chrome",
     )
-
     parser.add_argument(
         "--headless",
         action="store_true",
-        help=(
-            "Avvia il browser senza finestra. Funziona soltanto quando "
-            "la sessione persistente è ancora valida."
-        ),
+        help="Avvia il browser senza finestra usando una sessione valida.",
     )
-
     parser.add_argument(
         "--check-session",
         action="store_true",
-        help=(
-            "Apre Accredia e verifica che la sessione possa "
-            "accedere alla pagina dei risultati."
-        ),
+        help="Verifica la sessione senza scaricare certificati.",
     )
-
     return parser
 
 
 def config_from_arguments(
     parser: argparse.ArgumentParser,
 ) -> ScraperConfig:
-    """Converte gli argomenti CLI nella configurazione dell'applicazione."""
-
     arguments = parser.parse_args()
-
+    region = (
+        " ".join(arguments.region.split())
+        if arguments.region
+        else None
+    )
     config = ScraperConfig(
-        # `resolve()` genera un percorso assoluto compatibile con Windows.
         output_root=arguments.output_root.resolve(),
         profile_dir=arguments.profile_dir.resolve(),
         delay_seconds=arguments.delay,
         request_timeout_ms=arguments.timeout * 1_000,
-        max_retries=arguments.retries,
+        network_retries=arguments.retries,
         browser_channel=arguments.browser_channel,
         headless=arguments.headless,
         check_session=arguments.check_session,
+        region=region,
     )
 
     try:
         config.validate()
     except ValueError as error:
-        # `parser.error()` mostra il messaggio e termina con exit code 2.
         parser.error(str(error))
 
     return config
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
 def configure_logging() -> None:
-    """
-    Configura il logging usando Rich.
-
-    Il logger rimarrà disponibile per errori, retry e diagnostica,
-    mentre pannelli e tabelle verranno usati per le informazioni principali.
-    """
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -292,39 +264,20 @@ def configure_logging() -> None:
                 tracebacks_show_locals=False,
             )
         ],
-        # `force=True` evita configurazioni duplicate se main viene richiamato
-        # più volte durante i test.
         force=True,
     )
 
-# ---------------------------------------------------------------------------
-# Interfaccia del terminale
-# ---------------------------------------------------------------------------
 
 def print_application_header() -> None:
-    """Mostra l'intestazione principale dell'applicazione."""
-
     title = Text()
     title.append("ACCREDIA", style="bold cyan")
     title.append(" DOWNLOADER", style="bold white")
-
-    subtitle = Text(
-        "Raccolta e aggiornamento dei certificati",
-        style="dim white",
-    )
-
-    version = Text(
-        f"Versione {APP_VERSION}",
-        style="dim cyan",
-    )
-
     content = Group(
         title,
-        subtitle,
+        Text("Snapshot regionali dei certificati", style="dim white"),
         Text(""),
-        version,
+        Text(f"Versione {APP_VERSION}", style="dim cyan"),
     )
-
     CONSOLE.print()
     CONSOLE.print(
         Panel(
@@ -337,17 +290,13 @@ def print_application_header() -> None:
 
 
 def format_enabled(value: bool) -> Text:
-    """Converte un valore booleano in uno stato leggibile."""
-
-    if value:
-        return Text("ATTIVATA", style="bold yellow")
-
-    return Text("DISATTIVATA", style="bold green")
+    return Text(
+        "ATTIVATA" if value else "DISATTIVATA",
+        style="bold yellow" if value else "bold green",
+    )
 
 
 def print_configuration(config: ScraperConfig) -> None:
-    """Mostra la configurazione in una tabella compatta."""
-
     table = Table(
         box=box.SIMPLE,
         show_header=False,
@@ -355,42 +304,24 @@ def print_configuration(config: ScraperConfig) -> None:
         safe_box=True,
         expand=True,
     )
-
-    table.add_column(
-        "Parametro",
-        style="bold cyan",
-        no_wrap=True,
-        width=24,
-    )
-
-    table.add_column(
-        "Valore",
-        style="white",
-        overflow="fold",
-    )
-
-    table.add_row("Directory dati", str(config.output_root))
-    table.add_row("Directory pagine", str(config.pages_dir))
+    table.add_column("Parametro", style="bold cyan", width=24)
+    table.add_column("Valore", overflow="fold")
+    table.add_row("Regione", config.region or "nessuna")
+    table.add_row("JSON regionale", str(config.certificates_path))
+    table.add_row("Directory stato", str(config.state_dir))
     table.add_row("Profilo Playwright", str(config.profile_dir))
     table.add_row("Browser", config.browser_channel)
     table.add_row("Modalità headless", format_enabled(config.headless))
-    table.add_row(
-        "Ritardo richieste",
-        f"{config.delay_seconds:.1f} secondi",
-    )
+    table.add_row("Ritardo richieste", f"{config.delay_seconds:.1f} s")
     table.add_row(
         "Timeout",
-        f"{config.request_timeout_ms // 1_000} secondi",
+        f"{config.request_timeout_ms // 1_000} s",
     )
+    table.add_row("Retry rete", str(config.network_retries))
     table.add_row(
-        "Retry massimi",
-        str(config.max_retries),
-    )
-    table.add_row(
-        "Controllo sessione",
+        "Solo controllo sessione",
         format_enabled(config.check_session),
     )
-
     CONSOLE.print(
         Panel(
             table,
@@ -403,68 +334,36 @@ def print_configuration(config: ScraperConfig) -> None:
     )
 
 
-def print_ready_message() -> None:
-    """Comunica che la configurazione è stata validata."""
+def configured_results_url(config: ScraperConfig) -> str:
+    results_url = RESULTS_URL
 
-    message = Text()
-    message.append("OK", style="bold green")
-    message.append("  Configurazione validata. ")
-    message.append(
-        "Il downloader è pronto per essere avviato.",
-        style="dim",
-    )
+    if config.region is not None:
+        results_url = build_region_url(results_url, config.region)
 
-    CONSOLE.print(
-        Panel(
-            message,
-            border_style="green",
-            padding=(0, 1),
-            safe_box=True,
-        )
-    )
+    return build_page_url(results_url, 0)
+
 
 def is_results_page(snapshot: PageSnapshot) -> bool:
-    """Controlla superficialmente se la pagina contiene risultati."""
-
     if CAPTCHA_GATE_TEXT.casefold() in snapshot.html.casefold():
         return False
 
     soup = BeautifulSoup(snapshot.html, "lxml")
-
     tables = [
         table
-        for table in soup.select(
-            CERTIFICATE_TABLE_SELECTOR
-        )
+        for table in soup.select(CERTIFICATE_TABLE_SELECTOR)
         if CERTIFICATE_MARKER.casefold()
         in table.get_text(" ", strip=True).casefold()
     ]
-
-    return (
-        parse_total_results(snapshot.html) is not None
-        and len(tables) > 0
-    )
+    return parse_total_results(snapshot.html) is not None and bool(tables)
 
 
 def print_manual_validation_instructions() -> None:
-    """Mostra le istruzioni per la validazione manuale."""
-
-    message = Text()
-
-    message.append(
-        "La sessione non consente ancora l'accesso ai risultati.\n\n",
-        style="bold yellow",
-    )
-    message.append(
-        "1. Completa manualmente il CAPTCHA nel browser.\n"
-        "2. Lascia vuoti i filtri per ottenere tutti i risultati.\n"
-        "3. Clicca Cerca.\n"
-        "4. Attendi che venga mostrato l'elenco dei certificati."
-    )
-
     CONSOLE.print(
         Panel(
-            message,
+            "1. Completa manualmente il CAPTCHA nel browser.\n"
+            "2. Lascia vuoti i filtri.\n"
+            "3. Clicca Cerca e attendi i risultati.\n"
+            "4. Torna al terminale e conferma.",
             title="[bold]VERIFICA MANUALE[/bold]",
             title_align="left",
             border_style="yellow",
@@ -474,14 +373,72 @@ def print_manual_validation_instructions() -> None:
     )
 
 
-def print_session_success(
-    *,
-    total_results: int,
-    records_on_page: int,
-    current_url: str,
-) -> None:
-    """Mostra il risultato positivo del controllo."""
+def run_session_check(config: ScraperConfig) -> int:
+    try:
+        with AccrediaBrowserClient(
+            profile_dir=config.profile_dir,
+            browser_channel=config.browser_channel,
+            headless=config.headless,
+            timeout_ms=config.request_timeout_ms,
+            max_retries=config.network_retries,
+        ) as client:
+            results_url = configured_results_url(config)
+            snapshot = client.navigate(results_url)
 
+            if not is_results_page(snapshot):
+                if config.headless:
+                    raise SessionExpiredError(
+                        "Sessione non valida: ripeti senza --headless."
+                    )
+
+                client.navigate(SEARCH_URL)
+                print_manual_validation_instructions()
+                confirmed = Confirm.ask(
+                    "Hai completato il CAPTCHA e visualizzi i risultati?",
+                    console=CONSOLE,
+                    default=True,
+                )
+
+                if not confirmed:
+                    return 2
+
+                snapshot = client.navigate(results_url)
+
+            if not is_results_page(snapshot):
+                raise SessionExpiredError(
+                    "La pagina corrente non contiene risultati validi."
+                )
+
+            soup = BeautifulSoup(snapshot.html, "lxml")
+            total_results = parse_total_results(snapshot.html)
+            table_count = len(
+                soup.select(CERTIFICATE_TABLE_SELECTOR)
+            )
+            CONSOLE.print(
+                Panel(
+                    f"Sessione valida\n"
+                    f"Regione: {config.region or 'tutte'}\n"
+                    f"Risultati: {total_results:,}\n"
+                    f"Tabelle nella prima pagina: {table_count}",
+                    title="[bold]CONTROLLO COMPLETATO[/bold]",
+                    border_style="green",
+                    safe_box=True,
+                )
+            )
+            return 0
+    except (BrowserClientError, SessionExpiredError) as error:
+        CONSOLE.print(
+            Panel(
+                str(error),
+                title="[bold]SESSIONE NON VALIDA[/bold]",
+                border_style="red",
+                safe_box=True,
+            )
+        )
+        return 2
+
+
+def print_region_summary(summary: RegionalRunSummary) -> None:
     table = Table(
         box=box.SIMPLE,
         show_header=False,
@@ -489,55 +446,76 @@ def print_session_success(
         safe_box=True,
         expand=True,
     )
-
-    table.add_column(
-        "Parametro",
-        style="bold green",
-        width=24,
-        no_wrap=True,
-    )
-    table.add_column(
-        "Valore",
-        overflow="fold",
-    )
-
+    table.add_column("Parametro", style="bold green", width=24)
+    table.add_column("Valore", overflow="fold")
+    table.add_row("Regione", summary.region)
+    table.add_row("Pagine", str(summary.total_pages))
+    table.add_row("Tabelle elaborate", str(summary.tables_processed))
+    table.add_row("Record unici", str(summary.unique_records))
     table.add_row(
-        "Stato sessione",
-        "[bold green]VALIDA[/bold green]",
+        "Duplicati accorpati",
+        str(summary.duplicates_collapsed),
     )
-    table.add_row(
-        "Risultati",
-        f"{total_results:,}".replace(",", "."),
-    )
-    table.add_row(
-        "Tabelle nella pagina",
-        str(records_on_page),
-    )
-    table.add_row(
-        "URL corrente",
-        current_url,
-    )
-
+    table.add_row("Nuovi", str(summary.new_records))
+    table.add_row("Aggiornati", str(summary.updated_records))
+    table.add_row("Invariati", str(summary.unchanged_records))
+    table.add_row("Non più presenti", str(summary.missing_records))
+    table.add_row("File", str(summary.output_path))
     CONSOLE.print(
         Panel(
             table,
-            title="[bold]CONTROLLO COMPLETATO[/bold]",
+            title="[bold]REGIONE COMPLETATA[/bold]",
             title_align="left",
             border_style="green",
-            padding=(0, 1),
             safe_box=True,
         )
     )
 
 
-def run_session_check(
-    config: ScraperConfig,
-) -> int:
-    """
-    Verifica la sessione senza scaricare o salvare certificati.
+def run_region_download(config: ScraperConfig) -> int:
+    if config.region is None:
+        raise ValueError("Nessuna regione configurata.")
 
-    Se necessario permette all'utente di completare manualmente il CAPTCHA.
-    """
+    layout = RegionStorageLayout(config.storage_root)
+    progress = Progress(
+        SpinnerColumn(style="cyan"),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=CONSOLE,
+        expand=True,
+    )
+    task_id: int | None = None
+
+    def on_start(
+        total_results: int,
+        total_pages: int,
+        completed_pages: int,
+        resumed: bool,
+    ) -> None:
+        nonlocal task_id
+        mode = "ripresa" if resumed else "nuova esecuzione"
+        progress.console.print(
+            f"[cyan]{config.region}[/cyan]: "
+            f"{total_results:,} risultati, {total_pages:,} pagine "
+            f"({mode})."
+        )
+        task_id = progress.add_task(
+            config.region or "Regione",
+            total=total_pages,
+            completed=completed_pages,
+        )
+
+    def on_page(
+        url_page: int,
+        completed_pages: int,
+        total_pages: int,
+    ) -> None:
+        del url_page, total_pages
+
+        if task_id is not None:
+            progress.update(task_id, completed=completed_pages)
 
     try:
         with AccrediaBrowserClient(
@@ -545,106 +523,84 @@ def run_session_check(
             browser_channel=config.browser_channel,
             headless=config.headless,
             timeout_ms=config.request_timeout_ms,
-            max_retries=config.max_retries,
+            max_retries=config.network_retries,
         ) as client:
-            CONSOLE.print(
-                "\n[cyan]Apertura della pagina dei risultati...[/cyan]"
-            )
-
-            snapshot = client.navigate(RESULTS_URL)
-
-            if not is_results_page(snapshot):
-                if config.headless:
-                    CONSOLE.print(
-                        Panel(
-                            "La sessione non è valida. "
-                            "Ripeti il controllo senza --headless.",
-                            border_style="red",
-                            safe_box=True,
-                        )
-                    )
-                    return 2
-
-                # Torniamo alla maschera per permettere il CAPTCHA.
-                client.navigate(SEARCH_URL)
-                print_manual_validation_instructions()
-
-                Confirm.ask(
-                    "Hai completato il CAPTCHA e visualizzi i risultati?",
-                    console=CONSOLE,
-                    default=True,
+            with progress:
+                summary = download_region(
+                    client=client,
+                    layout=layout,
+                    region=config.region,
+                    results_url=configured_results_url(config),
+                    delay_seconds=config.delay_seconds,
+                    local_retries=LOCAL_FILE_RETRIES,
+                    on_start=on_start,
+                    on_page=on_page,
                 )
 
-                snapshot = client.current_snapshot()
-
-            if not is_results_page(snapshot):
-                CONSOLE.print(
-                    Panel(
-                        "La pagina corrente non contiene risultati validi.",
-                        border_style="red",
-                        safe_box=True,
-                    )
-                )
-                return 2
-
-            soup = BeautifulSoup(snapshot.html, "lxml")
-
-            tables = [
-                table
-                for table in soup.select(
-                    CERTIFICATE_TABLE_SELECTOR
-                )
-                if CERTIFICATE_MARKER.casefold()
-                in table.get_text(" ", strip=True).casefold()
-            ]
-
-            total_results = parse_total_results(
-                snapshot.html
-            )
-
-            if total_results is None:
-                return 2
-
-            print_session_success(
-                total_results=total_results,
-                records_on_page=len(tables),
-                current_url=snapshot.url,
-            )
-
-            return 0
-
-    except BrowserClientError as error:
-        CONSOLE.print(
-            Panel(
-                str(error),
-                title="[bold]ERRORE BROWSER[/bold]",
-                border_style="red",
-                safe_box=True,
-            )
+        print_region_summary(summary)
+        return 0
+    except SessionExpiredError as error:
+        title = "SESSIONE NON VALIDA"
+        border_style = "yellow"
+        error_message = str(error)
+        exit_code = 2
+    except KeyboardInterrupt:
+        title = "ESECUZIONE INTERROTTA"
+        border_style = "yellow"
+        error_message = (
+            "Le pagine già completate sono conservate nello staging. "
+            "Puoi rilanciare lo stesso comando oggi per riprendere."
         )
-        return 2
+        exit_code = 130
+    except (
+        BrowserClientError,
+        ParsingError,
+        RegionDownloadError,
+        StorageError,
+        OSError,
+        ValueError,
+    ) as error:
+        title = "DOWNLOAD NON COMPLETATO"
+        border_style = "red"
+        error_message = str(error)
+        exit_code = 2
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
+    CONSOLE.print(
+        Panel(
+            error_message,
+            title=f"[bold]{title}[/bold]",
+            border_style=border_style,
+            safe_box=True,
+        )
+    )
+    return exit_code
+
+
+def print_ready_message() -> None:
+    CONSOLE.print(
+        Panel(
+            "Configurazione valida. Specifica --region per avviare "
+            "il download oppure usa --check-session.",
+            border_style="green",
+            safe_box=True,
+        )
+    )
+
 
 def main() -> int:
-    """Punto di ingresso del programma."""
-
     configure_logging()
     print_application_header()
-
     parser = build_argument_parser()
     config = config_from_arguments(parser)
-
     print_configuration(config)
 
     if config.check_session:
         return run_session_check(config)
 
-    print_ready_message()
+    if config.region is not None:
+        return run_region_download(config)
 
-    # Nei prossimi blocchi verrà avviato qui il downloader.
+    print_ready_message()
     return 0
 
 

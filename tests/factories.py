@@ -12,6 +12,7 @@ def build_record(
     *,
     scope: str = "Erogazione di servizi.",
     address: str = "Via Roma, 1",
+    issued_on: str = "2025-03-04",
     url_page: int = 0,
     position: int = 1,
 ) -> CertificateRecord:
@@ -40,7 +41,7 @@ def build_record(
 
     return CertificateRecord.create(
         certificate_number="ABC-123",
-        issued_on="2025-03-04",
+        issued_on=issued_on,
         status="in corso di validità",
         accreditation_body=AccreditationBody(
             code="0895",
@@ -57,6 +58,12 @@ def build_record(
         sectors=[],
         updated_on="2026-08-03",
         source=source,
-        raw_text="Contenuto completo della tabella.",
-        raw_html="<table><tr><td>Contenuto</td></tr></table>",
+        raw_text=(
+            f"Certificato ABC-123 emesso il {issued_on}. {scope}"
+        ),
+        raw_html=(
+            "<table><tr><td>"
+            f"Certificato ABC-123 emesso il {issued_on}. {scope}"
+            "</td></tr></table>"
+        ),
     )

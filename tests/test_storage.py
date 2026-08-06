@@ -1,4 +1,4 @@
-"""Test della struttura dei file e della scrittura atomica."""
+"""Test dello staging SQLite e del JSON regionale."""
 
 import json
 import tempfile
@@ -6,267 +6,192 @@ import unittest
 from pathlib import Path
 
 from accredia_downloader.storage import (
-    RecordChange,
-    RecordIndex,
-    StorageLayout,
-    StorageManager,
+    RegionStorageLayout,
+    RegionalIndex,
+    StagingDatabase,
     atomic_write_text,
-    write_certificate,
+    finalize_region,
 )
 from tests.factories import build_record
 
 
-class StorageLayoutTests(unittest.TestCase):
-    def test_creates_expected_directories(self) -> None:
+class RegionStorageLayoutTests(unittest.TestCase):
+    def test_creates_regional_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory) / "documenti" / "accredia"
-            layout = StorageLayout(root)
+            root = Path(temporary_directory) / "regioni" / "abruzzo"
+            layout = RegionStorageLayout(root)
 
             layout.create_directories()
 
-            self.assertTrue(layout.pages_dir.is_dir())
+            self.assertTrue(layout.root.is_dir())
             self.assertTrue(layout.state_dir.is_dir())
-            self.assertTrue(layout.runs_dir.is_dir())
-            self.assertTrue(layout.archive_dir.is_dir())
-            self.assertTrue(layout.errors_dir.is_dir())
-
-    def test_uses_non_padded_page_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            layout = StorageLayout(Path(temporary_directory))
-            record = build_record(url_page=0)
-
-            destination = layout.certificate_path(record)
-
-            self.assertEqual(destination.parent.name, "1")
             self.assertEqual(
-                destination.name,
-                f"cert-{record.record_id}.json",
+                layout.certificates_path.name,
+                "certificati.json",
+            )
+            self.assertEqual(
+                layout.staging_path.name,
+                "staging.sqlite",
             )
 
 
 class AtomicWriteTests(unittest.TestCase):
-    def test_writes_utf8_content(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            destination = Path(temporary_directory) / "test.json"
-
-            atomic_write_text(
-                destination,
-                '{"city":"Città di Castello"}\n',
-            )
-
-            content = destination.read_text(encoding="utf-8")
-
-            self.assertEqual(
-                content,
-                '{"city":"Città di Castello"}\n',
-            )
-
-    def test_replaces_existing_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            destination = Path(temporary_directory) / "test.json"
-
-            atomic_write_text(destination, "prima versione\n")
-            atomic_write_text(destination, "seconda versione\n")
-
-            self.assertEqual(
-                destination.read_text(encoding="utf-8"),
-                "seconda versione\n",
-            )
-
-    def test_does_not_leave_temporary_files(self) -> None:
+    def test_replaces_utf8_file_without_temporary_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             destination = directory / "test.json"
 
-            atomic_write_text(destination, "{}\n")
+            atomic_write_text(destination, "prima versione\n")
+            atomic_write_text(
+                destination,
+                "{\"città\":\"L'Aquila\"}\n",
+            )
 
-            temporary_files = list(directory.glob("*.tmp"))
+            self.assertEqual(
+                destination.read_text(encoding="utf-8"),
+                "{\"città\":\"L'Aquila\"}\n",
+            )
+            self.assertEqual(list(directory.glob("*.tmp")), [])
 
-            self.assertEqual(temporary_files, [])
 
-
-class CertificateWriterTests(unittest.TestCase):
-    def test_writes_valid_certificate_json(self) -> None:
+class StagingDatabaseTests(unittest.TestCase):
+    def test_collapses_only_identical_tables(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            layout = StorageLayout(Path(temporary_directory))
-            record = build_record()
+            layout = RegionStorageLayout(Path(temporary_directory))
 
-            destination = write_certificate(layout, record)
+            first = build_record(position=1)
+            identical = build_record(position=2)
+            punctuation_change = build_record(
+                position=3,
+                scope="Erogazione di servizi,",
+            )
 
-            self.assertTrue(destination.is_file())
-            self.assertEqual(destination.parent.name, "1")
+            with StagingDatabase(layout) as staging:
+                staging.stage_page(
+                    (first, identical, punctuation_change),
+                    url_page=0,
+                    completed_at="2026-08-06T12:01:00+02:00",
+                )
+
+                self.assertEqual(staging.counts(), (3, 2, 1))
+
+    def test_replacing_page_does_not_duplicate_occurrences(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            layout = RegionStorageLayout(Path(temporary_directory))
+            records = (
+                build_record(position=1),
+                build_record(position=2),
+            )
+
+            with StagingDatabase(layout) as staging:
+                staging.stage_page(
+                    records,
+                    url_page=0,
+                    completed_at="2026-08-06T12:01:00+02:00",
+                )
+                staging.stage_page(
+                    records,
+                    url_page=0,
+                    completed_at="2026-08-06T12:02:00+02:00",
+                )
+
+                self.assertEqual(staging.counts(), (2, 1, 1))
+                self.assertEqual(staging.completed_pages(), {0})
+
+    def test_exports_one_json_for_the_region(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            layout = RegionStorageLayout(Path(temporary_directory))
+            first = build_record(position=1)
+            identical = build_record(position=2)
+            different = build_record(
+                position=3,
+                scope="Scopo differente.",
+            )
+
+            with StagingDatabase(layout) as staging:
+                staging.stage_page(
+                    (first, identical, different),
+                    url_page=0,
+                    completed_at="2026-08-06T12:01:00+02:00",
+                )
+
+                summary = finalize_region(
+                    layout=layout,
+                    staging=staging,
+                    region="Abruzzo",
+                    run_id="run-1",
+                    started_at="2026-08-06T12:00:00+02:00",
+                    completed_at="2026-08-06T12:02:00+02:00",
+                    total_results=3,
+                    total_pages=1,
+                )
 
             payload = json.loads(
-                destination.read_text(encoding="utf-8")
+                layout.certificates_path.read_text(encoding="utf-8")
             )
 
+            self.assertEqual(summary.tables_processed, 3)
+            self.assertEqual(summary.unique_records, 2)
+            self.assertEqual(summary.duplicates_collapsed, 1)
+            self.assertEqual(payload["region"], "Abruzzo")
+            self.assertEqual(len(payload["records"]), 2)
             self.assertEqual(
-                payload["record_id"],
-                record.record_id,
+                sorted(
+                    record["source_occurrences"]
+                    for record in payload["records"]
+                ),
+                [1, 2],
             )
+            self.assertTrue(layout.index_path.is_file())
+            self.assertTrue(layout.last_run_path.is_file())
             self.assertEqual(
-                payload["certificate_number"],
-                "ABC-123",
-            )
-            self.assertEqual(
-                payload["company"]["site"]["city"],
-                "Caserta",
+                len(RegionalIndex.load(layout.index_path).entries),
+                2,
             )
 
-class StorageManagerTests(unittest.TestCase):
-    def test_saves_new_record_and_index(self) -> None:
+    def test_classifies_changed_content_as_update(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = StorageManager.open(
-                Path(temporary_directory)
-            )
-            record = build_record()
+            layout = RegionStorageLayout(Path(temporary_directory))
 
-            result = manager.save_record(
-                record,
-                run_id="run-1",
-            )
-            manager.save_index()
+            with StagingDatabase(layout) as first_staging:
+                first_staging.stage_page(
+                    (build_record(),),
+                    url_page=0,
+                    completed_at="2026-08-06T12:01:00+02:00",
+                )
+                finalize_region(
+                    layout=layout,
+                    staging=first_staging,
+                    region="Abruzzo",
+                    run_id="run-1",
+                    started_at="2026-08-06T12:00:00+02:00",
+                    completed_at="2026-08-06T12:02:00+02:00",
+                    total_results=1,
+                    total_pages=1,
+                )
 
-            self.assertEqual(result.change, RecordChange.NEW)
-            self.assertTrue(result.path.is_file())
-            self.assertTrue(manager.layout.index_path.is_file())
+            layout.remove_staging()
 
-            loaded_index = RecordIndex.load(
-                manager.layout.index_path
-            )
-            entry = loaded_index.get(record.record_id)
+            with StagingDatabase(layout) as second_staging:
+                second_staging.stage_page(
+                    (build_record(scope="Scopo aggiornato."),),
+                    url_page=0,
+                    completed_at="2026-08-07T12:01:00+02:00",
+                )
+                summary = finalize_region(
+                    layout=layout,
+                    staging=second_staging,
+                    region="Abruzzo",
+                    run_id="run-2",
+                    started_at="2026-08-07T12:00:00+02:00",
+                    completed_at="2026-08-07T12:02:00+02:00",
+                    total_results=1,
+                    total_pages=1,
+                )
 
-            self.assertIsNotNone(entry)
-            self.assertEqual(
-                entry.content_hash,
-                record.content_hash,
-            )
+            self.assertEqual(summary.updated_records, 1)
+            self.assertEqual(summary.missing_records, 0)
 
-    def test_does_not_rewrite_unchanged_record(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = StorageManager.open(
-                Path(temporary_directory)
-            )
-            record = build_record()
-
-            manager.save_record(record, run_id="run-1")
-
-            result = manager.save_record(
-                record,
-                run_id="run-2",
-            )
-
-            self.assertEqual(
-                result.change,
-                RecordChange.UNCHANGED,
-            )
-
-    def test_updates_changed_record(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = StorageManager.open(
-                Path(temporary_directory)
-            )
-
-            original = build_record(
-                scope="Primo scopo."
-            )
-            updated = build_record(
-                scope="Scopo aggiornato."
-            )
-
-            manager.save_record(original, run_id="run-1")
-            result = manager.save_record(
-                updated,
-                run_id="run-2",
-            )
-
-            self.assertEqual(
-                original.record_id,
-                updated.record_id,
-            )
-            self.assertEqual(
-                result.change,
-                RecordChange.UPDATED,
-            )
-
-            payload = json.loads(
-                result.path.read_text(encoding="utf-8")
-            )
-
-            self.assertEqual(
-                payload["scope"],
-                "Scopo aggiornato.",
-            )
-
-    def test_moves_record_to_new_page(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = StorageManager.open(
-                Path(temporary_directory)
-            )
-
-            original = build_record(url_page=0)
-            moved = build_record(url_page=1)
-
-            first_result = manager.save_record(
-                original,
-                run_id="run-1",
-            )
-            moved_result = manager.save_record(
-                moved,
-                run_id="run-2",
-            )
-
-            self.assertEqual(
-                moved_result.change,
-                RecordChange.MOVED,
-            )
-            self.assertFalse(first_result.path.exists())
-            self.assertTrue(moved_result.path.exists())
-            self.assertEqual(
-                moved_result.path.parent.name,
-                "2",
-            )
-
-    def test_recovers_deleted_file(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = StorageManager.open(
-                Path(temporary_directory)
-            )
-            record = build_record()
-
-            first_result = manager.save_record(
-                record,
-                run_id="run-1",
-            )
-            first_result.path.unlink()
-
-            recovered_result = manager.save_record(
-                record,
-                run_id="run-2",
-            )
-
-            self.assertEqual(
-                recovered_result.change,
-                RecordChange.RECOVERED,
-            )
-            self.assertTrue(recovered_result.path.exists())
-
-    def test_marks_records_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            manager = StorageManager.open(
-                Path(temporary_directory)
-            )
-            record = build_record()
-
-            manager.save_record(record, run_id="run-1")
-            manager.finish_run("run-1")
-
-            missing_count = manager.finish_run("run-2")
-            entry = manager.index.get(record.record_id)
-
-            self.assertEqual(missing_count, 1)
-            self.assertIsNotNone(entry)
-            self.assertEqual(entry.missing_runs, 1)
 
 if __name__ == "__main__":
     unittest.main()
