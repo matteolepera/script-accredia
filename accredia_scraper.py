@@ -8,6 +8,7 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -17,15 +18,18 @@ from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
+    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
+    TimeElapsedColumn,
     TimeRemainingColumn,
 )
 from rich.prompt import Confirm
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 from accredia_downloader import __version__
 from accredia_downloader.batch import (
@@ -61,7 +65,20 @@ from accredia_downloader.storage import (
 
 APP_NAME = "Accredia Downloader"
 APP_VERSION = __version__
-CONSOLE = Console(highlight=False)
+TERMINAL_THEME = Theme(
+    {
+        "flux.cyan": "bold bright_cyan",
+        "flux.amber": "bold bright_yellow",
+        "flux.red": "bold bright_red",
+        "flux.green": "bold bright_green",
+        "flux.blue": "bold bright_blue",
+        "flux.dim": "dim white",
+    }
+)
+CONSOLE = Console(
+    highlight=False,
+    theme=TERMINAL_THEME,
+)
 
 SEARCH_URL = (
     "https://services.accredia.it/ppsearch/"
@@ -331,21 +348,84 @@ def configure_logging() -> None:
     )
 
 
-def print_application_header() -> None:
-    title = Text()
-    title.append("ACCREDIA", style="bold cyan")
-    title.append(" DOWNLOADER", style="bold white")
-    content = Group(
-        title,
-        Text("Snapshot regionali dei certificati", style="dim white"),
-        Text(""),
-        Text(f"Versione {APP_VERSION}", style="dim cyan"),
+def format_circuit_time(value: datetime) -> str:
+    """Formatta l'orario come un display del circuito temporale."""
+
+    months = (
+        "GEN",
+        "FEB",
+        "MAR",
+        "APR",
+        "MAG",
+        "GIU",
+        "LUG",
+        "AGO",
+        "SET",
+        "OTT",
+        "NOV",
+        "DIC",
     )
+    month = months[value.month - 1]
+    return f"{value.day:02d} {month} {value.year:04d}  {value:%H:%M:%S}"
+
+
+def print_application_header(config: ScraperConfig) -> None:
+    """Mostra il pannello principale ispirato ai circuiti temporali."""
+
+    if config.check_session:
+        destination = (
+            config.region.upper()
+            if config.region is not None
+            else "SESSIONE PLAYWRIGHT"
+        )
+        mode = "DIAGNOSTICA"
+    elif config.all_regions:
+        destination = "ITALIA // 20 REGIONI"
+        mode = "CICLO NAZIONALE"
+    elif config.region is not None:
+        destination = config.region.upper()
+        mode = "TRATTA REGIONALE"
+    else:
+        destination = "NON PROGRAMMATA"
+        mode = "STANDBY"
+
+    title = Text(justify="center")
+    title.append("ACCREDIA", style="flux.cyan")
+    title.append(" // ", style="flux.dim")
+    title.append("CERTIFICATE TIME CIRCUIT", style="bold white")
+
+    circuits = Table.grid(expand=True, padding=(0, 1))
+    circuits.add_column(width=20)
+    circuits.add_column(ratio=1)
+    circuits.add_row(
+        Text("DESTINAZIONE", style="flux.red"),
+        Text(destination, style="bold bright_red"),
+    )
+    circuits.add_row(
+        Text("TEMPO PRESENTE", style="flux.green"),
+        Text(
+            format_circuit_time(datetime.now().astimezone()),
+            style="bold bright_green",
+        ),
+    )
+    circuits.add_row(
+        Text("FLUSSO DATI", style="flux.amber"),
+        Text(mode, style="bold bright_yellow"),
+    )
+
+    footer = Text(justify="right")
+    footer.append("FLUX CAPACITOR: ", style="flux.dim")
+    footer.append("ONLINE", style="flux.cyan")
+    footer.append(f"   //   VERSIONE {APP_VERSION}", style="flux.dim")
+
+    content = Group(title, Text(""), circuits, Text(""), footer)
     CONSOLE.print()
     CONSOLE.print(
         Panel(
             content,
-            border_style="cyan",
+            title="[flux.blue]SYSTEM READY[/flux.blue]",
+            title_align="right",
+            border_style="bright_cyan",
             padding=(1, 2),
             safe_box=True,
         )
@@ -354,8 +434,8 @@ def print_application_header() -> None:
 
 def format_enabled(value: bool) -> Text:
     return Text(
-        "ATTIVATA" if value else "DISATTIVATA",
-        style="bold yellow" if value else "bold green",
+        "ARMATA" if value else "OFFLINE",
+        style="flux.amber" if value else "flux.green",
     )
 
 
@@ -367,7 +447,7 @@ def print_configuration(config: ScraperConfig) -> None:
         safe_box=True,
         expand=True,
     )
-    table.add_column("Parametro", style="bold cyan", width=24)
+    table.add_column("Circuito", style="flux.cyan", width=24)
     table.add_column("Valore", overflow="fold")
     scope = "tutte (automatico)" if config.all_regions else (
         config.region or "nessuna"
@@ -401,9 +481,11 @@ def print_configuration(config: ScraperConfig) -> None:
     CONSOLE.print(
         Panel(
             table,
-            title="[bold]CONFIGURAZIONE[/bold]",
+            title="[flux.blue]TIME CIRCUITS // CONFIGURAZIONE[/flux.blue]",
             title_align="left",
-            border_style="blue",
+            subtitle="[flux.dim]INPUT LOCKED[/flux.dim]",
+            subtitle_align="right",
+            border_style="bright_blue",
             padding=(0, 1),
             safe_box=True,
         )
@@ -440,9 +522,9 @@ def print_manual_validation_instructions() -> None:
             "2. Lascia vuoti i filtri.\n"
             "3. Clicca Cerca e attendi i risultati.\n"
             "4. Torna al terminale e conferma.",
-            title="[bold]VERIFICA MANUALE[/bold]",
+            title="[flux.amber]SESSION LOCK // VERIFICA MANUALE[/flux.amber]",
             title_align="left",
-            border_style="yellow",
+            border_style="bright_yellow",
             padding=(1, 2),
             safe_box=True,
         )
@@ -496,8 +578,9 @@ def run_session_check(config: ScraperConfig) -> int:
                     f"Regione: {config.region or 'tutte'}\n"
                     f"Risultati: {total_results:,}\n"
                     f"Tabelle nella prima pagina: {table_count}",
-                    title="[bold]CONTROLLO COMPLETATO[/bold]",
-                    border_style="green",
+                    title="[flux.green]SESSIONE AGGANCIATA[/flux.green]",
+                    subtitle="[flux.dim]TEMPORAL LINK STABLE[/flux.dim]",
+                    border_style="bright_green",
                     safe_box=True,
                 )
             )
@@ -506,8 +589,8 @@ def run_session_check(config: ScraperConfig) -> int:
         CONSOLE.print(
             Panel(
                 str(error),
-                title="[bold]SESSIONE NON VALIDA[/bold]",
-                border_style="red",
+                title="[flux.red]SESSION LINK LOST[/flux.red]",
+                border_style="bright_red",
                 safe_box=True,
             )
         )
@@ -522,7 +605,7 @@ def print_region_summary(summary: RegionalRunSummary) -> None:
         safe_box=True,
         expand=True,
     )
-    table.add_column("Parametro", style="bold green", width=24)
+    table.add_column("Telemetria", style="flux.green", width=24)
     table.add_column("Valore", overflow="fold")
     table.add_row("Regione", summary.region)
     table.add_row("Pagine", str(summary.total_pages))
@@ -540,9 +623,11 @@ def print_region_summary(summary: RegionalRunSummary) -> None:
     CONSOLE.print(
         Panel(
             table,
-            title="[bold]REGIONE COMPLETATA[/bold]",
+            title="[flux.green]DESTINAZIONE RAGGIUNTA[/flux.green]",
             title_align="left",
-            border_style="green",
+            subtitle="[flux.dim]SNAPSHOT LOCKED[/flux.dim]",
+            subtitle_align="right",
+            border_style="bright_green",
             safe_box=True,
         )
     )
@@ -571,10 +656,18 @@ def download_region_with_client(
 
     layout = RegionStorageLayout(config.storage_root)
     progress = Progress(
-        SpinnerColumn(style="cyan"),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(bar_width=None),
+        SpinnerColumn("dots12", style="flux.cyan"),
+        TextColumn("[flux.cyan]FLUX[/flux.cyan] {task.description}"),
+        BarColumn(
+            bar_width=None,
+            style="bright_blue",
+            complete_style="bright_cyan",
+            finished_style="bright_green",
+            pulse_style="bright_yellow",
+        ),
+        MofNCompleteColumn(),
         TaskProgressColumn(),
+        TimeElapsedColumn(),
         TimeRemainingColumn(),
         console=CONSOLE,
         expand=True,
@@ -590,9 +683,10 @@ def download_region_with_client(
         nonlocal task_id
         mode = "ripresa" if resumed else "nuova esecuzione"
         progress.console.print(
-            f"[cyan]{config.region}[/cyan]: "
-            f"{total_results:,} risultati, {total_pages:,} pagine "
-            f"({mode})."
+            f"[flux.amber]COORDINATE LOCKED[/flux.amber]  "
+            f"[flux.cyan]{config.region}[/flux.cyan]  //  "
+            f"{total_results:,} risultati  //  {total_pages:,} pagine  //  "
+            f"{mode.upper()}"
         )
         task_id = progress.add_task(
             config.region or "Regione",
@@ -632,7 +726,7 @@ def print_download_error(
     CONSOLE.print(
         Panel(
             message,
-            title=f"[bold]{title}[/bold]",
+            title=f"[flux.red]{title}[/flux.red]",
             border_style=border_style,
             safe_box=True,
         )
@@ -706,24 +800,26 @@ def print_batch_plan(decisions: list[RegionDecision]) -> None:
     """Mostra quali regioni saranno elaborate o saltate."""
 
     table = Table(box=box.SIMPLE, safe_box=True, expand=True)
-    table.add_column("Regione", style="bold cyan")
+    table.add_column("Coordinate", style="flux.cyan")
     table.add_column("Azione", width=14)
     table.add_column("Motivo", overflow="fold")
 
     for decision in decisions:
         action = (
-            "[bold green]SCARICA[/bold green]"
+            "[flux.green]IN CODA[/flux.green]"
             if decision.should_download
-            else "[dim]SALTA[/dim]"
+            else "[flux.dim]ARCHIVIATA[/flux.dim]"
         )
         table.add_row(decision.region, action, decision.reason)
 
     CONSOLE.print(
         Panel(
             table,
-            title="[bold]PIANO NAZIONALE[/bold]",
+            title="[flux.blue]DESTINATION BOARD // ITALIA[/flux.blue]",
             title_align="left",
-            border_style="blue",
+            subtitle="[flux.dim]20 COORDINATE TEMPORALI[/flux.dim]",
+            subtitle_align="right",
+            border_style="bright_blue",
             safe_box=True,
         )
     )
@@ -743,7 +839,7 @@ def print_batch_summary(
         safe_box=True,
         expand=True,
     )
-    table.add_column("Stato", style="bold cyan", width=24)
+    table.add_column("Telemetria", style="flux.cyan", width=24)
     table.add_column("Valore")
     table.add_row("Regioni completate", str(len(completed)))
     table.add_row("Regioni saltate", str(len(skipped)))
@@ -765,9 +861,11 @@ def print_batch_summary(
     CONSOLE.print(
         Panel(
             table,
-            title="[bold]CICLO NAZIONALE COMPLETATO[/bold]",
+            title="[flux.green]VIAGGIO NAZIONALE COMPLETATO[/flux.green]",
             title_align="left",
-            border_style="red" if failed else "green",
+            subtitle="[flux.dim]TEMPORAL RUN REPORT[/flux.dim]",
+            subtitle_align="right",
+            border_style="bright_red" if failed else "bright_green",
             safe_box=True,
         )
     )
@@ -799,10 +897,10 @@ def run_all_regions(config: ScraperConfig) -> int:
             for index, decision in enumerate(pending, start=1):
                 region_config = replace(config, region=decision.region)
                 rule_title = (
-                    f"[bold cyan]{index}/{len(pending)} "
-                    f"{decision.region}[/bold cyan]"
+                    f"[flux.amber]T-{index:02d}/{len(pending):02d}[/flux.amber] "
+                    f"[flux.cyan]{decision.region}[/flux.cyan]"
                 )
-                CONSOLE.rule(rule_title)
+                CONSOLE.rule(rule_title, style="bright_blue")
 
                 try:
                     summary = download_region_with_client(
@@ -866,7 +964,9 @@ def print_ready_message() -> None:
         Panel(
             "Configurazione valida. Specifica --region o --all-regions "
             "per avviare il download, oppure usa --check-session.",
-            border_style="green",
+            title="[flux.amber]DESTINAZIONE NON IMPOSTATA[/flux.amber]",
+            subtitle="[flux.dim]SYSTEM STANDBY[/flux.dim]",
+            border_style="bright_yellow",
             safe_box=True,
         )
     )
@@ -874,9 +974,9 @@ def print_ready_message() -> None:
 
 def main() -> int:
     configure_logging()
-    print_application_header()
     parser = build_argument_parser()
     config = config_from_arguments(parser)
+    print_application_header(config)
     print_configuration(config)
 
     if config.check_session:

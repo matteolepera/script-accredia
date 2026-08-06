@@ -9,6 +9,11 @@ temporaneo. Al termine produce un solo `certificati.json` per regione.
 Il CAPTCHA non viene risolto né aggirato automaticamente. Quando la sessione
 non è valida, l'utente deve completare manualmente la verifica nel browser.
 
+L'interfaccia del terminale usa Rich con una palette ispirata ai circuiti
+temporali: ciano per il flusso, ambra per le operazioni in corso, verde per gli
+snapshot completati e rosso per gli errori. Le tabelle mantengono la modalità
+compatibile con PowerShell e Windows Terminal.
+
 Prima di effettuare estrazioni massive è responsabilità dell'utilizzatore
 verificare di essere autorizzato e rispettare condizioni d'uso, limiti tecnici
 e frequenza delle richieste del servizio.
