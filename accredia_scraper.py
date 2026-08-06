@@ -7,7 +7,7 @@ import argparse
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -28,6 +28,11 @@ from rich.table import Table
 from rich.text import Text
 
 from accredia_downloader import __version__
+from accredia_downloader.batch import (
+    ITALIAN_REGIONS,
+    RegionDecision,
+    decide_region_download,
+)
 from accredia_downloader.client import (
     AccrediaBrowserClient,
     BrowserClientError,
@@ -115,6 +120,9 @@ class ScraperConfig:
     headless: bool
     check_session: bool
     region: str | None
+    all_regions: bool
+    refresh_existing: bool
+    refresh_after_days: int | None
 
     @property
     def storage_root(self) -> Path:
@@ -151,6 +159,37 @@ class ScraperConfig:
         if self.region is not None:
             region_slug(self.region)
 
+        if self.region is not None and self.all_regions:
+            raise ValueError(
+                "--region e --all-regions non possono essere usati insieme."
+            )
+
+        if (
+            self.refresh_existing
+            or self.refresh_after_days is not None
+        ) and not self.all_regions:
+            raise ValueError(
+                "Le opzioni di aggiornamento automatico richiedono "
+                "--all-regions."
+            )
+
+        if (
+            self.refresh_existing
+            and self.refresh_after_days is not None
+        ):
+            raise ValueError(
+                "Usa soltanto una tra --refresh-existing e "
+                "--refresh-after-days."
+            )
+
+        if (
+            self.refresh_after_days is not None
+            and self.refresh_after_days < 0
+        ):
+            raise ValueError(
+                "--refresh-after-days non può essere negativo."
+            )
+
 
 def build_argument_parser() -> argparse.ArgumentParser:
     """Definisce i parametri accettati dal programma."""
@@ -177,10 +216,31 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Default: .accredia-playwright-profile"
         ),
     )
-    parser.add_argument(
+    scope_group = parser.add_mutually_exclusive_group()
+    scope_group.add_argument(
         "--region",
         type=str,
         help="Regione da scaricare, per esempio Abruzzo.",
+    )
+    scope_group.add_argument(
+        "--all-regions",
+        action="store_true",
+        help="Cicla automaticamente tutte le 20 regioni italiane.",
+    )
+    refresh_group = parser.add_mutually_exclusive_group()
+    refresh_group.add_argument(
+        "--refresh-existing",
+        action="store_true",
+        help="Con --all-regions aggiorna anche gli snapshot completi.",
+    )
+    refresh_group.add_argument(
+        "--refresh-after-days",
+        type=int,
+        metavar="GIORNI",
+        help=(
+            "Con --all-regions aggiorna gli snapshot con almeno "
+            "questi giorni."
+        ),
     )
     parser.add_argument(
         "--delay",
@@ -238,6 +298,9 @@ def config_from_arguments(
         headless=arguments.headless,
         check_session=arguments.check_session,
         region=region,
+        all_regions=arguments.all_regions,
+        refresh_existing=arguments.refresh_existing,
+        refresh_after_days=arguments.refresh_after_days,
     )
 
     try:
@@ -306,9 +369,11 @@ def print_configuration(config: ScraperConfig) -> None:
     )
     table.add_column("Parametro", style="bold cyan", width=24)
     table.add_column("Valore", overflow="fold")
-    table.add_row("Regione", config.region or "nessuna")
-    table.add_row("JSON regionale", str(config.certificates_path))
-    table.add_row("Directory stato", str(config.state_dir))
+    scope = "tutte (automatico)" if config.all_regions else (
+        config.region or "nessuna"
+    )
+    table.add_row("Regione", scope)
+    table.add_row("Output", str(config.storage_root))
     table.add_row("Profilo Playwright", str(config.profile_dir))
     table.add_row("Browser", config.browser_channel)
     table.add_row("Modalità headless", format_enabled(config.headless))
@@ -318,6 +383,17 @@ def print_configuration(config: ScraperConfig) -> None:
         f"{config.request_timeout_ms // 1_000} s",
     )
     table.add_row("Retry rete", str(config.network_retries))
+    if config.all_regions:
+        if config.refresh_existing:
+            update_mode = "aggiorna tutti gli snapshot"
+        elif config.refresh_after_days is not None:
+            update_mode = (
+                f"aggiorna dopo {config.refresh_after_days} giorni"
+            )
+        else:
+            update_mode = "scarica soltanto le regioni mancanti"
+
+        table.add_row("Politica aggiornamento", update_mode)
     table.add_row(
         "Solo controllo sessione",
         format_enabled(config.check_session),
@@ -472,7 +548,24 @@ def print_region_summary(summary: RegionalRunSummary) -> None:
     )
 
 
-def run_region_download(config: ScraperConfig) -> int:
+def create_browser_client(config: ScraperConfig) -> AccrediaBrowserClient:
+    """Crea il client condivisibile tra una o più regioni."""
+
+    return AccrediaBrowserClient(
+        profile_dir=config.profile_dir,
+        browser_channel=config.browser_channel,
+        headless=config.headless,
+        timeout_ms=config.request_timeout_ms,
+        max_retries=config.network_retries,
+    )
+
+
+def download_region_with_client(
+    config: ScraperConfig,
+    client: AccrediaBrowserClient,
+) -> RegionalRunSummary:
+    """Scarica una regione usando un client già avviato."""
+
     if config.region is None:
         raise ValueError("Nessuna regione configurata.")
 
@@ -517,25 +610,41 @@ def run_region_download(config: ScraperConfig) -> int:
         if task_id is not None:
             progress.update(task_id, completed=completed_pages)
 
+    with progress:
+        return download_region(
+            client=client,
+            layout=layout,
+            region=config.region,
+            results_url=configured_results_url(config),
+            delay_seconds=config.delay_seconds,
+            local_retries=LOCAL_FILE_RETRIES,
+            on_start=on_start,
+            on_page=on_page,
+        )
+
+
+def print_download_error(
+    message: str,
+    *,
+    title: str,
+    border_style: str,
+) -> None:
+    CONSOLE.print(
+        Panel(
+            message,
+            title=f"[bold]{title}[/bold]",
+            border_style=border_style,
+            safe_box=True,
+        )
+    )
+
+
+def run_region_download(config: ScraperConfig) -> int:
+    """Esegue il comando manuale relativo a una singola regione."""
+
     try:
-        with AccrediaBrowserClient(
-            profile_dir=config.profile_dir,
-            browser_channel=config.browser_channel,
-            headless=config.headless,
-            timeout_ms=config.request_timeout_ms,
-            max_retries=config.network_retries,
-        ) as client:
-            with progress:
-                summary = download_region(
-                    client=client,
-                    layout=layout,
-                    region=config.region,
-                    results_url=configured_results_url(config),
-                    delay_seconds=config.delay_seconds,
-                    local_retries=LOCAL_FILE_RETRIES,
-                    on_start=on_start,
-                    on_page=on_page,
-                )
+        with create_browser_client(config) as client:
+            summary = download_region_with_client(config, client)
 
         print_region_summary(summary)
         return 0
@@ -565,22 +674,198 @@ def run_region_download(config: ScraperConfig) -> int:
         error_message = str(error)
         exit_code = 2
 
+    print_download_error(
+        error_message,
+        title=title,
+        border_style=border_style,
+    )
+    return exit_code
+
+
+def build_region_decisions(config: ScraperConfig) -> list[RegionDecision]:
+    """Costruisce il piano del ciclo nazionale dai file locali."""
+
+    decisions: list[RegionDecision] = []
+
+    for region in ITALIAN_REGIONS:
+        region_config = replace(config, region=region)
+        layout = RegionStorageLayout(region_config.storage_root)
+        decisions.append(
+            decide_region_download(
+                layout=layout,
+                region=region,
+                refresh_existing=config.refresh_existing,
+                refresh_after_days=config.refresh_after_days,
+            )
+        )
+
+    return decisions
+
+
+def print_batch_plan(decisions: list[RegionDecision]) -> None:
+    """Mostra quali regioni saranno elaborate o saltate."""
+
+    table = Table(box=box.SIMPLE, safe_box=True, expand=True)
+    table.add_column("Regione", style="bold cyan")
+    table.add_column("Azione", width=14)
+    table.add_column("Motivo", overflow="fold")
+
+    for decision in decisions:
+        action = (
+            "[bold green]SCARICA[/bold green]"
+            if decision.should_download
+            else "[dim]SALTA[/dim]"
+        )
+        table.add_row(decision.region, action, decision.reason)
+
     CONSOLE.print(
         Panel(
-            error_message,
-            title=f"[bold]{title}[/bold]",
-            border_style=border_style,
+            table,
+            title="[bold]PIANO NAZIONALE[/bold]",
+            title_align="left",
+            border_style="blue",
             safe_box=True,
         )
     )
-    return exit_code
+
+
+def print_batch_summary(
+    *,
+    completed: list[RegionalRunSummary],
+    skipped: list[RegionDecision],
+    failed: list[tuple[str, str]],
+) -> None:
+    """Mostra il riepilogo finale del ciclo nazionale."""
+
+    table = Table(
+        box=box.SIMPLE,
+        show_header=False,
+        safe_box=True,
+        expand=True,
+    )
+    table.add_column("Stato", style="bold cyan", width=24)
+    table.add_column("Valore")
+    table.add_row("Regioni completate", str(len(completed)))
+    table.add_row("Regioni saltate", str(len(skipped)))
+    table.add_row("Regioni fallite", str(len(failed)))
+    table.add_row(
+        "Record unici elaborati",
+        f"{sum(item.unique_records for item in completed):,}",
+    )
+
+    if failed:
+        table.add_row(
+            "Errori",
+            "\n".join(
+                f"{region}: {message}"
+                for region, message in failed
+            ),
+        )
+
+    CONSOLE.print(
+        Panel(
+            table,
+            title="[bold]CICLO NAZIONALE COMPLETATO[/bold]",
+            title_align="left",
+            border_style="red" if failed else "green",
+            safe_box=True,
+        )
+    )
+
+
+def run_all_regions(config: ScraperConfig) -> int:
+    """Esegue tutte le regioni con una sola sessione Playwright."""
+
+    decisions = build_region_decisions(config)
+    pending = [item for item in decisions if item.should_download]
+    skipped = [item for item in decisions if not item.should_download]
+    completed: list[RegionalRunSummary] = []
+    failed: list[tuple[str, str]] = []
+
+    print_batch_plan(decisions)
+
+    if not pending:
+        print_batch_summary(
+            completed=completed,
+            skipped=skipped,
+            failed=failed,
+        )
+        return 0
+
+    try:
+        # Lo stesso browser e gli stessi cookie vengono mantenuti per tutto
+        # il ciclo, evitando venti riavvii e nuove verifiche della sessione.
+        with create_browser_client(config) as client:
+            for index, decision in enumerate(pending, start=1):
+                region_config = replace(config, region=decision.region)
+                rule_title = (
+                    f"[bold cyan]{index}/{len(pending)} "
+                    f"{decision.region}[/bold cyan]"
+                )
+                CONSOLE.rule(rule_title)
+
+                try:
+                    summary = download_region_with_client(
+                        region_config,
+                        client,
+                    )
+                    completed.append(summary)
+                    print_region_summary(summary)
+                except SessionExpiredError:
+                    # È una sottoclasse di ParsingError, ma riguarda l'intera
+                    # sessione: deve interrompere il ciclo nazionale.
+                    raise
+                except (
+                    ParsingError,
+                    RegionDownloadError,
+                    StorageError,
+                    OSError,
+                    ValueError,
+                ) as error:
+                    # Un problema limitato ai dati di una regione non deve
+                    # impedire il tentativo delle regioni successive.
+                    failed.append((decision.region, str(error)))
+                    print_download_error(
+                        str(error),
+                        title=f"{decision.region}: DOWNLOAD NON COMPLETATO",
+                        border_style="red",
+                    )
+    except SessionExpiredError as error:
+        print_download_error(
+            str(error),
+            title="SESSIONE NON VALIDA: CICLO INTERROTTO",
+            border_style="yellow",
+        )
+        return 2
+    except KeyboardInterrupt:
+        print_download_error(
+            "Le pagine completate sono conservate nei rispettivi staging. "
+            "Rilancia lo stesso comando oggi per riprendere.",
+            title="CICLO INTERROTTO",
+            border_style="yellow",
+        )
+        return 130
+    except BrowserClientError as error:
+        print_download_error(
+            str(error),
+            title="BROWSER NON DISPONIBILE: CICLO INTERROTTO",
+            border_style="red",
+        )
+        return 2
+
+    print_batch_summary(
+        completed=completed,
+        skipped=skipped,
+        failed=failed,
+    )
+    return 2 if failed else 0
 
 
 def print_ready_message() -> None:
     CONSOLE.print(
         Panel(
-            "Configurazione valida. Specifica --region per avviare "
-            "il download oppure usa --check-session.",
+            "Configurazione valida. Specifica --region o --all-regions "
+            "per avviare il download, oppure usa --check-session.",
             border_style="green",
             safe_box=True,
         )
@@ -599,6 +884,9 @@ def main() -> int:
 
     if config.region is not None:
         return run_region_download(config)
+
+    if config.all_regions:
+        return run_all_regions(config)
 
     print_ready_message()
     return 0

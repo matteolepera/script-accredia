@@ -129,10 +129,64 @@ Valle d'Aosta         -> valle-d-aosta
 Trentino-Alto Adige   -> trentino-alto-adige
 ```
 
+## Download automatico di tutte le regioni
+
+Per completare automaticamente tutte le regioni usando una sola sessione
+Firefox:
+
+```powershell
+python accredia_scraper.py `
+  --all-regions `
+  --browser-channel firefox `
+  --profile-dir .accredia-firefox-profile
+```
+
+Senza opzioni aggiuntive il ciclo scarica soltanto le regioni mancanti o con
+stato locale incompleto. Una regione viene saltata esclusivamente quando sono
+presenti e coerenti tutti e tre i file:
+
+```text
+certificati.json
+state/records-index.jsonl
+state/last-run.json
+```
+
+Gli eventuali `staging.sqlite` incompleti continuano a essere gestiti dalla
+singola regione. Se compatibili, il download riprende dalle pagine già salvate.
+
+Per aggiornare completamente anche gli snapshot esistenti:
+
+```powershell
+python accredia_scraper.py `
+  --all-regions `
+  --refresh-existing `
+  --browser-channel firefox `
+  --profile-dir .accredia-firefox-profile
+```
+
+Per aggiornare soltanto le regioni il cui ultimo completamento risale ad almeno
+7 giorni prima:
+
+```powershell
+python accredia_scraper.py `
+  --all-regions `
+  --refresh-after-days 7 `
+  --browser-channel firefox `
+  --profile-dir .accredia-firefox-profile
+```
+
+Il ciclo mantiene aperto un unico browser. Un errore nei dati di una regione
+viene riportato nel riepilogo e il programma prova quella successiva. Se la
+sessione CAPTCHA o il browser non sono più disponibili, il ciclo si interrompe
+per evitare una sequenza di errori identici.
+
 ## Parametri principali
 
 ```text
 --region REGION
+--all-regions
+--refresh-existing
+--refresh-after-days GIORNI
 --delay SECONDI
 --timeout SECONDI
 --retries NUMERO
@@ -292,6 +346,12 @@ Il riepilogo distingue:
 
 Il JSON finale contiene lo snapshot corrente. L'indice conserva soltanto gli
 hash necessari ai confronti successivi.
+
+La ricerca pubblica consente un filtro per data di rilascio, ma non per data di
+ultimo aggiornamento. Per riconoscere in modo affidabile modifiche, sospensioni
+e rimozioni, una regione selezionata per l'aggiornamento viene quindi riletta
+completamente. `--refresh-after-days` riduce il lavoro scegliendo quali regioni
+aggiornare, senza trasformare il controllo in un confronto parziale insicuro.
 
 ## Test
 
