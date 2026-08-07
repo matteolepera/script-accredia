@@ -101,6 +101,25 @@ Se viene aperta la maschera di ricerca:
 Dopo la conferma il programma ricarica automaticamente l'URL con il filtro
 regionale configurato.
 
+## Recupero automatico della sessione scaduta
+
+Se la sessione CAPTCHA scade durante un download visibile, il programma non
+termina più immediatamente:
+
+1. mette in pausa la regione e chiude correttamente lo staging SQLite;
+2. porta il browser già aperto alla maschera di verifica;
+3. attende il completamento manuale del CAPTCHA;
+4. controlla che la nuova sessione mostri risultati validi;
+5. riavvia la stessa regione dalla prima pagina non ancora completata.
+
+Se la verifica non riesce è possibile riprovare senza chiudere il comando. Se
+viene annullata, le pagine completate rimangono nello staging e potranno essere
+riprese rilanciando lo stesso comando nello stesso giorno.
+
+In modalità `--headless` la verifica manuale non è possibile: il programma si
+ferma con un messaggio esplicativo e conserva lo staging. Il CAPTCHA non viene
+risolto o aggirato automaticamente.
+
 ## Download di una regione
 
 Con Chrome:

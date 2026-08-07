@@ -531,6 +531,73 @@ def print_manual_validation_instructions() -> None:
     )
 
 
+def recover_browser_session(
+    client: AccrediaBrowserClient,
+    config: ScraperConfig,
+) -> PageSnapshot:
+    """Guida il rinnovo manuale del CAPTCHA e valida la nuova sessione."""
+
+    if config.headless:
+        raise SessionExpiredError(
+            "La sessione è scaduta durante il download. Le pagine sono "
+            "salve nello staging: rilancia senza --headless per completare "
+            "manualmente il CAPTCHA e riprendere."
+        )
+
+    while True:
+        CONSOLE.print(
+            Panel(
+                "L'operazione è in pausa; gli eventuali dati già registrati "
+                "nello staging sono al sicuro. "
+                "Firefox verrà portato alla maschera di verifica; dopo il "
+                "CAPTCHA la stessa regione riprenderà automaticamente.",
+                title="[flux.amber]SESSION LINK LOST // PAUSA[/flux.amber]",
+                subtitle="[flux.dim]SQLITE CHECKPOINT SAFE[/flux.dim]",
+                border_style="bright_yellow",
+                safe_box=True,
+            )
+        )
+        client.navigate(SEARCH_URL)
+        print_manual_validation_instructions()
+        confirmed = Confirm.ask(
+            "Hai completato il CAPTCHA e visualizzi i risultati?",
+            console=CONSOLE,
+            default=True,
+        )
+
+        if not confirmed:
+            raise SessionExpiredError(
+                "Ripristino della sessione annullato. Le pagine completate "
+                "rimangono nello staging."
+            )
+
+        snapshot = client.navigate(configured_results_url(config))
+
+        if is_results_page(snapshot):
+            CONSOLE.print(
+                Panel(
+                    "Sessione riattivata. Ripresa della regione dalla prima "
+                    "pagina non ancora completata.",
+                    title="[flux.green]SESSION LINK RESTORED[/flux.green]",
+                    border_style="bright_green",
+                    safe_box=True,
+                )
+            )
+            return snapshot
+
+        retry = Confirm.ask(
+            "La sessione non risulta ancora valida. Vuoi riprovare?",
+            console=CONSOLE,
+            default=True,
+        )
+
+        if not retry:
+            raise SessionExpiredError(
+                "Sessione non ripristinata. Le pagine completate rimangono "
+                "nello staging."
+            )
+
+
 def run_session_check(config: ScraperConfig) -> int:
     try:
         with AccrediaBrowserClient(
@@ -544,23 +611,7 @@ def run_session_check(config: ScraperConfig) -> int:
             snapshot = client.navigate(results_url)
 
             if not is_results_page(snapshot):
-                if config.headless:
-                    raise SessionExpiredError(
-                        "Sessione non valida: ripeti senza --headless."
-                    )
-
-                client.navigate(SEARCH_URL)
-                print_manual_validation_instructions()
-                confirmed = Confirm.ask(
-                    "Hai completato il CAPTCHA e visualizzi i risultati?",
-                    console=CONSOLE,
-                    default=True,
-                )
-
-                if not confirmed:
-                    return 2
-
-                snapshot = client.navigate(results_url)
+                snapshot = recover_browser_session(client, config)
 
             if not is_results_page(snapshot):
                 raise SessionExpiredError(
@@ -738,7 +789,15 @@ def run_region_download(config: ScraperConfig) -> int:
 
     try:
         with create_browser_client(config) as client:
-            summary = download_region_with_client(config, client)
+            while True:
+                try:
+                    summary = download_region_with_client(config, client)
+                    break
+                except SessionExpiredError:
+                    # SQLite è già stato chiuso dal ciclo regionale. Dopo la
+                    # verifica manuale il nuovo tentativo riprenderà le pagine
+                    # registrate nello staging compatibile.
+                    recover_browser_session(client, config)
 
         print_region_summary(summary)
         return 0
@@ -903,15 +962,26 @@ def run_all_regions(config: ScraperConfig) -> int:
                 CONSOLE.rule(rule_title, style="bright_blue")
 
                 try:
-                    summary = download_region_with_client(
-                        region_config,
-                        client,
-                    )
+                    while True:
+                        try:
+                            summary = download_region_with_client(
+                                region_config,
+                                client,
+                            )
+                            break
+                        except SessionExpiredError:
+                            # La sessione viene rinnovata nello stesso browser;
+                            # poi la regione riparte dallo staging esistente.
+                            recover_browser_session(
+                                client,
+                                region_config,
+                            )
+
                     completed.append(summary)
                     print_region_summary(summary)
                 except SessionExpiredError:
-                    # È una sottoclasse di ParsingError, ma riguarda l'intera
-                    # sessione: deve interrompere il ciclo nazionale.
+                    # Annullamento o modalità headless: interrompe il ciclo
+                    # nazionale conservando gli staging regionali.
                     raise
                 except (
                     ParsingError,
