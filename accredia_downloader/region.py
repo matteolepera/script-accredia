@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from datetime import datetime
 
-from accredia_downloader.client import AccrediaBrowserClient
+from accredia_downloader.client import (
+    AccrediaBrowserClient,
+    retry_delay_seconds,
+)
 from accredia_downloader.models import SCHEMA_VERSION
 from accredia_downloader.parser import (
     ParsingError,
@@ -25,6 +29,10 @@ from accredia_downloader.storage import (
     StorageError,
     finalize_region,
 )
+
+
+LOGGER = logging.getLogger(__name__)
+PAGE_VALIDATION_RETRIES = 5
 
 
 class RegionDownloadError(RuntimeError):
@@ -72,19 +80,47 @@ def _prepare_staging(
     metadata = staging.metadata()
     current_date = started_at.date().isoformat()
 
-    compatible = bool(metadata) and all(
-        (
-            metadata.get("region") == region,
-            metadata.get("run_date") == current_date,
-            metadata.get("total_results") == str(total_results),
-            metadata.get("total_pages") == str(total_pages),
-            metadata.get("record_schema_version")
-            == str(SCHEMA_VERSION),
-            metadata.get("status") == "running",
+    incompatibilities: list[str] = []
+
+    if not metadata:
+        incompatibilities.append("metadati assenti")
+    else:
+        checks = (
+            ("regione", metadata.get("region"), region),
+            (
+                "totale risultati",
+                metadata.get("total_results"),
+                str(total_results),
+            ),
+            (
+                "numero pagine",
+                metadata.get("total_pages"),
+                str(total_pages),
+            ),
+            (
+                "versione schema",
+                metadata.get("record_schema_version"),
+                str(SCHEMA_VERSION),
+            ),
+            ("stato", metadata.get("status"), "running"),
         )
-    )
+
+        for label, stored_value, current_value in checks:
+            if stored_value != current_value:
+                incompatibilities.append(
+                    f"{label}: {stored_value!r} -> {current_value!r}"
+                )
+
+    # La data non invalida più lo staging. Per download molto lunghi è più
+    # utile riprendere nei giorni successivi, purché totale e struttura della
+    # ricerca siano ancora identici.
+    compatible = bool(metadata) and not incompatibilities
 
     if staging_existed and not compatible:
+        LOGGER.warning(
+            "Staging precedente scartato (%s). Ripartenza dalla pagina 1.",
+            "; ".join(incompatibilities),
+        )
         staging.close()
         layout.remove_staging(retries=retries)
         staging = StagingDatabase(layout)
@@ -93,6 +129,17 @@ def _prepare_staging(
     resumed = bool(metadata) and compatible
 
     if resumed:
+        completed_count = len(staging.completed_pages())
+        LOGGER.info(
+            "Staging compatibile: ripresa di %s da %s pagine completate "
+            "(avviato il %s).",
+            region,
+            completed_count,
+            metadata.get("started_at", "data sconosciuta"),
+        )
+        staging.set_metadata(
+            last_resumed_at=started_at.isoformat(timespec="seconds"),
+        )
         return (
             staging,
             metadata["run_id"],
@@ -164,36 +211,73 @@ def download_region(
                 continue
 
             page_url = build_page_url(first_snapshot.url, url_page)
-
-            if url_page == 0:
-                page_html = first_snapshot.html
-                page_url = first_snapshot.url
-            else:
-                page_html = client.fetch_html(
-                    page_url,
-                    referer=first_snapshot.url,
-                )
-
-            scraped_at = datetime.now().astimezone().isoformat(
-                timespec="seconds"
-            )
-            parsed_page = parse_result_page(
-                page_html,
-                source_url=page_url,
-                url_page=url_page,
-                scraped_at=scraped_at,
-            )
             expected_records = expected_records_for_page(
                 total_results,
                 url_page,
             )
 
-            if parsed_page.record_count != expected_records:
-                raise ParsingError(
-                    f"Pagina {url_page + 1} incompleta: "
-                    f"trovati {parsed_page.record_count} record, "
-                    f"attesi {expected_records}."
+            for page_attempt in range(PAGE_VALIDATION_RETRIES + 1):
+                if url_page == 0 and page_attempt == 0:
+                    page_html = first_snapshot.html
+                    page_url = first_snapshot.url
+                else:
+                    page_html = client.fetch_html(
+                        page_url,
+                        referer=first_snapshot.url,
+                    )
+
+                scraped_at = datetime.now().astimezone().isoformat(
+                    timespec="seconds"
                 )
+                parsed_page = parse_result_page(
+                    page_html,
+                    source_url=page_url,
+                    url_page=url_page,
+                    scraped_at=scraped_at,
+                )
+
+                if parsed_page.record_count == expected_records:
+                    break
+
+                # Una pagina parziale può dipendere da un aggiornamento della
+                # banca dati. Rileggiamo subito il totale prima di ritentare.
+                current_first_html = client.fetch_html(
+                    build_page_url(first_snapshot.url, 0),
+                    referer=first_snapshot.url,
+                )
+                current_total = _read_required_total(current_first_html)
+
+                if current_total != total_results:
+                    staging.set_metadata(status="invalid")
+                    raise RegionChangedError(
+                        f"Pagina {url_page + 1} incoerente perché il totale "
+                        f"di {region} è cambiato: {total_results} -> "
+                        f"{current_total}. Lo staging verrà ricreato alla "
+                        "prossima esecuzione."
+                    )
+
+                if page_attempt >= PAGE_VALIDATION_RETRIES:
+                    raise ParsingError(
+                        f"Pagina {url_page + 1} ancora incompleta dopo "
+                        f"{PAGE_VALIDATION_RETRIES + 1} tentativi: trovati "
+                        f"{parsed_page.record_count} record, attesi "
+                        f"{expected_records}; totale regionale riconfermato "
+                        f"a {total_results}. Le pagine precedenti restano "
+                        "nello staging."
+                    )
+
+                retry_delay = retry_delay_seconds(page_attempt)
+                LOGGER.warning(
+                    "Pagina %s incompleta: trovati %s record, attesi %s. "
+                    "Totale invariato; nuovo tentativo %s/%s tra %.0f s.",
+                    url_page + 1,
+                    parsed_page.record_count,
+                    expected_records,
+                    page_attempt + 2,
+                    PAGE_VALIDATION_RETRIES + 1,
+                    retry_delay,
+                )
+                time.sleep(retry_delay)
 
             staging.stage_page(
                 parsed_page.records,

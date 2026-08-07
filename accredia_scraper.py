@@ -811,7 +811,8 @@ def run_region_download(config: ScraperConfig) -> int:
         border_style = "yellow"
         error_message = (
             "Le pagine già completate sono conservate nello staging. "
-            "Puoi rilanciare lo stesso comando oggi per riprendere."
+            "Puoi rilanciare lo stesso comando anche successivamente: la "
+            "ripresa avverrà se totale e struttura sono ancora compatibili."
         )
         exit_code = 130
     except (
@@ -1008,7 +1009,8 @@ def run_all_regions(config: ScraperConfig) -> int:
     except KeyboardInterrupt:
         print_download_error(
             "Le pagine completate sono conservate nei rispettivi staging. "
-            "Rilancia lo stesso comando oggi per riprendere.",
+            "Rilancia lo stesso comando anche successivamente: ogni regione "
+            "compatibile riprenderà dalla prima pagina mancante.",
             title="CICLO INTERROTTO",
             border_style="yellow",
         )

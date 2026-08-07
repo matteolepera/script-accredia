@@ -114,7 +114,8 @@ termina più immediatamente:
 
 Se la verifica non riesce è possibile riprovare senza chiudere il comando. Se
 viene annullata, le pagine completate rimangono nello staging e potranno essere
-riprese rilanciando lo stesso comando nello stesso giorno.
+riprese rilanciando lo stesso comando anche nei giorni successivi, purché il
+totale e il numero delle pagine della regione siano rimasti invariati.
 
 In modalità `--headless` la verifica manuale non è possibile: il programma si
 ferma con un messaggio esplicativo e conserva lo staging. Il CAPTCHA non viene
@@ -260,18 +261,35 @@ aggiornamenti senza caricare in memoria tutti gli HTML del JSON regionale.
 ## Ripartenza e consistenza
 
 Ogni pagina viene salvata in una singola transazione SQLite. Se il processo si
-interrompe, le pagine completate nello stesso giorno possono essere riprese.
+interrompe, le pagine completate possono essere riprese anche nei giorni
+successivi.
 
 Lo staging viene ricreato dalla pagina 1 quando:
 
-- appartiene a un giorno precedente;
 - il totale dei risultati è cambiato;
+- il numero delle pagine è cambiato;
 - la regione è differente;
-- la versione dello schema record è cambiata.
+- la versione dello schema record è cambiata;
+- il precedente staging non ha stato `running`.
+
+Quando uno staging viene scartato, il terminale mostra i valori precedenti e
+quelli correnti che hanno impedito la ripresa. La sola data di avvio non rende
+più incompatibile lo staging.
+
+Se una pagina contiene un numero inatteso di tabelle, il programma non termina
+al primo errore. Rilegge immediatamente il totale regionale e ritenta la pagina
+fino a 6 volte con backoff. Se il totale è cambiato, invalida lo staging; se il
+totale è invariato ma la pagina continua a essere incompleta, conserva tutte le
+pagine precedenti e riporta una diagnostica precisa.
 
 Prima della pubblicazione il totale viene letto nuovamente. Se è diverso dal
 totale iniziale, il JSON non viene sostituito e la regione dovrà essere
 riscaricata dalla pagina 1.
+
+La banca dati remota non espone uno snapshot transazionale: una sostituzione di
+record che lasci invariato il totale non può essere rilevata usando soltanto la
+paginazione. La ripresa tra giorni privilegia quindi la continuità operativa;
+gli aggiornamenti periodici completi restano il controllo più affidabile.
 
 ## Identificatori e duplicati
 
